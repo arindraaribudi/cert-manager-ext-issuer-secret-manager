@@ -4,6 +4,11 @@ on:
   push:
     tags:
       - "v*"
+  workflow_run:
+    workflows: ["release"]
+    types: [completed]
+    branches:
+      - "*"
 
 permissions:
   contents: read
@@ -12,11 +17,36 @@ permissions:
 jobs:
   docker:
     name: build + push multi-arch image
+    if: |
+      github.event_name == 'push' ||
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
+      - name: resolve tag + sha
+        id: resolve
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "push" ]; then
+            echo "tag=${{ github.ref_name }}" >>"$GITHUB_OUTPUT"
+            echo "sha=${{ github.sha }}" >>"$GITHUB_OUTPUT"
+          else
+            sha="${{ github.event.workflow_run.head_sha }}"
+            echo "sha=${sha}" >>"$GITHUB_OUTPUT"
+            tag=$(git ls-remote --tags "https://github.com/${GITHUB_REPOSITORY}.git" \
+              | awk -v sha="${sha}" '$1 ~ /^refs\/tags\/v[0-9]/ && $2 == sha {sub("refs/tags/","",$1); print $1}' \
+              | head -n1)
+            if [ -n "${tag}" ]; then
+              echo "tag=${tag}" >>"$GITHUB_OUTPUT"
+            else
+              echo "tag=latest" >>"$GITHUB_OUTPUT"
+            fi
+          fi
+
       - name: checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.resolve.outputs.sha }}
 
       - name: set up qemu
         uses: docker/setup-qemu-action@v3
@@ -37,7 +67,7 @@ jobs:
         with:
           images: ghcr.io/${{ github.repository }}
           tags: |
-            type=ref,event=tag
+            type=raw,value=${{ steps.resolve.outputs.tag }}
             type=raw,value=latest,enable={{is_default_branch}}
           flavor: latest=auto
 
@@ -56,9 +86,11 @@ jobs:
         if: always()
         run: |
           {
-            echo "### Docker ${{ github.ref_name }}"
+            echo "### Docker ${{ steps.resolve.outputs.tag }}"
             echo ""
             echo "- status: \`${{ job.status }}\`"
             echo "- image: \`ghcr.io/${{ github.repository }}\`"
-            echo "- tag: \`${{ github.ref_name }}\`"
+            echo "- tag: \`${{ steps.resolve.outputs.tag }}\`"
+            echo "- sha: \`${{ steps.resolve.outputs.sha }}\`"
+            echo "- trigger: \`${{ github.event_name }}\`"
           } >>"$GITHUB_STEP_SUMMARY"
