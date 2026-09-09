@@ -57,9 +57,10 @@ jobs:
           "$(go env GOPATH)/bin/govulncheck" ./...
 
       - name: golangci-lint
-        uses: golangci/golangci-lint-action@v6
+        uses: golangci/golangci-lint-action@v8
         with:
-          version: latest
+          version: v2.13.2
+          node-version: 24
           args: --timeout=5m
 
       - name: go test
@@ -156,18 +157,29 @@ jobs:
           git tag -a "${TAG}" -m "Release ${TAG}"
           git push origin "${TAG}"
 
-      - name: setup-qemu
-        uses: docker/setup-qemu-action@v3
+      - name: stage assets
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/release
+          cp config/install.yaml /tmp/release/install.yaml
+          ls -la /tmp/release
 
-      - name: release
-        uses: goreleaser/goreleaser-action@v6
+      - name: create github release
+        uses: softprops/action-gh-release@v2
         with:
-          version: latest
-          args: release --clean --fail-fast
+          tag_name: ${{ steps.version.outputs.tag }}
+          generate_release_notes: true
+          prerelease: ${{ inputs.prerelease }}
+          body: |
+            ## Install
+
+            ```bash
+            kubectl apply -f https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.tag }}/install.yaml
+            ```
+          files: |
+            /tmp/release/install.yaml
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GIT_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ steps.version.outputs.tag }}
 
       - name: summary
         if: always()

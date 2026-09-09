@@ -4,7 +4,7 @@ metadata:
   name: cert-manager-ext-issuer-secret-manager
 rules:
 - apiGroups: [""]
-  resources: ["secrets", "events"]
+  resources: ["secrets", "events", "namespaces"]
   verbs: ["get", "list", "watch", "create", "update", "patch"]
 - apiGroups: ["cert-manager.io"]
   resources: ["certificates", "certificates/status"]

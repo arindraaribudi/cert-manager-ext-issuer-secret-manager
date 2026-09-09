@@ -8,6 +8,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -97,10 +98,9 @@ func (r *IssuerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	}
 
 	// 4. Build k8s Secret
-	secret := &corev1.Secret{
+	secretTemplate := corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      cert.Spec.SecretName,
-			Namespace: cert.Namespace,
+			Name: cert.Spec.SecretName,
 			OwnerReferences: []metav1.OwnerReference{
 				*metav1.NewControllerRef(&cert, schema.GroupVersionKind{
 					Group: "cert-manager.io", Version: "v1", Kind: "Certificate",
@@ -114,16 +114,22 @@ func (r *IssuerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		},
 	}
 	if len(parsed.Chain) > 0 {
-		secret.Data[corev1.ServiceAccountRootCAKey] = parsed.Chain
+		secretTemplate.Data[corev1.ServiceAccountRootCAKey] = parsed.Chain
 	}
 
-	if err := r.Update(ctx, secret); err != nil {
-		if apierrors.IsNotFound(err) {
-			if err := r.Create(ctx, secret); err != nil {
-				return ctrl.Result{}, fmt.Errorf("create secret: %w", err)
-			}
-		} else {
-			return ctrl.Result{}, fmt.Errorf("update secret: %w", err)
+	// 4a. Resolve target namespaces.
+	// Namespaced Issuer → just the Certificate's ns.
+	// ClusterIssuer-kind → every non-terminating namespace in the cluster.
+	targets, err := r.targetNamespaces(ctx, &cert)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("list namespaces: %w", err)
+	}
+
+	for _, ns := range targets {
+		secret := secretTemplate.DeepCopy()
+		secret.Namespace = ns
+		if err := r.writeSecret(ctx, secret); err != nil {
+			return ctrl.Result{}, err
 		}
 	}
 
@@ -150,4 +156,36 @@ func (r *IssuerReconciler) lookupResolver(kind string) (SecretResolver, string) 
 		return nil, ""
 	}
 	return resolver, kind
+}
+
+// targetNamespaces returns the namespaces the cert's TLS Secret should be
+// written into. Namespaced Issuer → just cert.Namespace. ClusterIssuer-kind →
+// every non-terminating namespace in the cluster (fan-out).
+func (r *IssuerReconciler) targetNamespaces(ctx context.Context, cert *cmapi.Certificate) ([]string, error) {
+	if !strings.HasSuffix(cert.Spec.IssuerRef.Kind, "ClusterIssuer") {
+		return []string{cert.Namespace}, nil
+	}
+	var nsl corev1.NamespaceList
+	if err := r.List(ctx, &nsl); err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(nsl.Items))
+	for _, ns := range nsl.Items {
+		if ns.Status.Phase == corev1.NamespaceTerminating {
+			continue
+		}
+		out = append(out, ns.Name)
+	}
+	return out, nil
+}
+
+// writeSecret creates or updates the given Secret.
+func (r *IssuerReconciler) writeSecret(ctx context.Context, secret *corev1.Secret) error {
+	if err := r.Update(ctx, secret); err != nil {
+		if apierrors.IsNotFound(err) {
+			return r.Create(ctx, secret)
+		}
+		return fmt.Errorf("update secret %s/%s: %w", secret.Namespace, secret.Name, err)
+	}
+	return nil
 }

@@ -218,3 +218,62 @@ func TestReconcile_HappyPath(t *testing.T) {
 		t.Fatal("force-sync annotation not cleared")
 	}
 }
+
+func TestReconcile_ClusterIssuerFanOut(t *testing.T) {
+	certPemEscaped := `-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----`
+	keyPemEscaped := `-----BEGIN PRIVATE KEY-----\nMIIE\n-----END PRIVATE KEY-----`
+	payload := []byte(`{"certificate":"` + certPemEscaped + `","private_key":"` + keyPemEscaped + `"}`)
+
+	cert := &cmapi.Certificate{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "c1",
+			Namespace: "ns-cert",
+			Annotations: map[string]string{
+				AnnotationSecretName: "cloud/secret",
+			},
+		},
+		Spec: cmapi.CertificateSpec{
+			IssuerRef:  cmmeta.ObjectReference{Name: "aws-ci", Kind: "AWSSecretManagerClusterIssuer"},
+			SecretName: "tls-out",
+		},
+	}
+	nsCert := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "ns-cert"}}
+	nsA := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "ns-a"}}
+	nsB := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "ns-b"}}
+	nsTerm := &corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{Name: "ns-term"},
+		Status:     corev1.NamespaceStatus{Phase: corev1.NamespaceTerminating},
+	}
+
+	r := newTestReconciler(t, cert, nsCert, nsA, nsB, nsTerm)
+	r.ProviderResolvers = map[string]SecretResolver{
+		"AWSSecretManagerClusterIssuer": func(ctx context.Context, ref string) ([]byte, error) {
+			return payload, nil
+		},
+	}
+	r.PayloadKeysFromIssuer = func(ctx context.Context, c *cmapi.Certificate) (api.PayloadKeys, error) {
+		return api.PayloadKeys{}, nil
+	}
+
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "c1", Namespace: "ns-cert"}}); err != nil {
+		t.Fatalf("Reconcile error: %v", err)
+	}
+
+	// Secret must exist in ns-cert (cert's ns), ns-a, ns-b.
+	for _, ns := range []string{"ns-cert", "ns-a", "ns-b"} {
+		var sec corev1.Secret
+		if err := r.Get(context.Background(), types.NamespacedName{Name: "tls-out", Namespace: ns}, &sec); err != nil {
+			t.Fatalf("secret missing in %s: %v", ns, err)
+		}
+		if sec.Type != corev1.SecretTypeTLS {
+			t.Errorf("%s: type = %v, want TLS", ns, sec.Type)
+		}
+	}
+
+	// Terminating ns must be skipped.
+	var sec corev1.Secret
+	err := r.Get(context.Background(), types.NamespacedName{Name: "tls-out", Namespace: "ns-term"}, &sec)
+	if err == nil {
+		t.Fatal("secret unexpectedly written to terminating namespace")
+	}
+}
