@@ -152,8 +152,7 @@ jobs:
         with:
           app-id: ${{ vars.APP_ID }}
           private-key: ${{ secrets.APP_PRIVATE_KEY }}
-          permissions: |
-            contents: write
+          permission-contents: write
 
       - name: create + push tag
         env:
