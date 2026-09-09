@@ -1,0 +1,182 @@
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "Version bump type"
+        required: true
+        type: choice
+        default: patch
+        options:
+          - patch
+          - minor
+          - major
+          - custom
+      custom_version:
+        description: "Explicit semver (only when bump=custom). e.g. 0.2.0"
+        required: false
+        type: string
+        default: ""
+      tag_prefix:
+        description: "Tag prefix"
+        required: false
+        type: string
+        default: "v"
+      prerelease:
+        description: "Mark release as pre-release"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  preflight:
+    name: lint + test + build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: setup-go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.3"
+          cache: true
+
+      - name: security audit
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          "$(go env GOPATH)/bin/govulncheck" ./...
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+          args: --timeout=5m
+
+      - name: go test
+        run: go test ./...
+
+      - name: go build
+        run: CGO_ENABLED=0 go build -o /tmp/manager-build ./cmd
+
+  release:
+    name: release
+    runs-on: ubuntu-latest
+    needs: preflight
+    timeout-minutes: 30
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: setup-go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.3"
+
+      - name: resolve version
+        id: version
+        env:
+          BUMP: ${{ inputs.bump }}
+          CUSTOM: ${{ inputs.custom_version }}
+          PREFIX: ${{ inputs.tag_prefix }}
+        run: |
+          set -euo pipefail
+          # Semver: MAJOR.MINOR.PATCH (no leading 'v'); tag = "<prefix><ver>"
+          semver_re='^([0-9]+)\.([0-9]+)\.([0-9]+)$'
+
+          git fetch --tags --force
+
+          # Highest existing tag, e.g. v0.1.3 -> 0.1.3
+          latest="$(git tag --list "${PREFIX}*" --sort=-version:refname | head -n1 || true)"
+          if [ -n "${latest}" ]; then
+            current="${latest#${PREFIX}}"
+          else
+            current="0.0.0"
+          fi
+
+          if [[ "${current}" =~ ${semver_re} ]]; then
+            major="${BASH_REMATCH[1]}"
+            minor="${BASH_REMATCH[2]}"
+            patch="${BASH_REMATCH[3]}"
+          else
+            echo "::error::Latest tag '${latest:-<none>}' is not semver (${current}). Aborting." >&2
+            exit 1
+          fi
+
+          if [ "${BUMP}" = "custom" ]; then
+            if [ -z "${CUSTOM}" ]; then
+              echo "::error::bump=custom requires custom_version." >&2
+              exit 1
+            fi
+            if [[ "${CUSTOM}" =~ ${semver_re} ]]; then
+              next="${CUSTOM}"
+            else
+              echo "::error::custom_version '${CUSTOM}' is not semver MAJOR.MINOR.PATCH." >&2
+              exit 1
+            fi
+          else
+            case "${BUMP}" in
+              major) next="$((major + 1)).0.0" ;;
+              minor) next="${major}.$((minor + 1)).0" ;;
+              patch) next="${major}.${minor}.$((patch + 1))" ;;
+              *) echo "::error::Unknown bump '${BUMP}'." >&2; exit 1 ;;
+            esac
+          fi
+
+          tag="${PREFIX}${next}"
+          if git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
+            echo "::error::Tag '${tag}' already exists." >&2
+            exit 1
+          fi
+
+          echo "version=${next}" >>"${GITHUB_OUTPUT}"
+          echo "tag=${tag}" >>"${GITHUB_OUTPUT}"
+          echo "Resolved ${tag} (current was ${current}, bump=${BUMP})."
+
+      - name: create + push tag
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "${TAG}" -m "Release ${TAG}"
+          git push origin "${TAG}"
+
+      - name: setup-qemu
+        uses: docker/setup-qemu-action@v3
+
+      - name: release
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          version: latest
+          args: release --clean --fail-fast
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GIT_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.version.outputs.tag }}
+
+      - name: summary
+        if: always()
+        run: |
+          {
+            echo "### Release ${{ steps.version.outputs.tag }}"
+            echo ""
+            echo "- bump: \`${{ inputs.bump }}\`"
+            echo "- prerelease: \`${{ inputs.prerelease }}\`"
+            echo "- preflight: \`${{ needs.preflight.result }}\`"
+            echo "- release: \`${{ job.status }}\`"
+          } >>"$GITHUB_STEP_SUMMARY"
