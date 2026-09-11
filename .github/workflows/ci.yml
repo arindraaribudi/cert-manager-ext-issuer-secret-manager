@@ -38,10 +38,9 @@ jobs:
             sha="${{ github.event.workflow_run.head_sha }}"
             echo "sha=${sha}" >>"$GITHUB_OUTPUT"
             tag=$(git ls-remote --tags --sort=-v:refname "https://github.com/${GITHUB_REPOSITORY}.git" \
-              | awk '/refs\/tags\/v[0-9]/ {sub("refs/tags/","",$2); print $2}' \
-              | head -n1)
-            tag="${tag%^{}}"
-            tag="${tag%-}"
+              | grep -oE 'refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$' \
+              | head -n1 \
+              | sed 's|refs/tags/||')
             if [ -n "${tag}" ]; then
               echo "tag=${tag}" >>"$GITHUB_OUTPUT"
             else
