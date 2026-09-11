@@ -31,14 +31,16 @@ jobs:
         run: |
           set -euo pipefail
           if [ "${{ github.event_name }}" = "push" ]; then
-            echo "tag=${{ github.ref_name }}" >>"$GITHUB_OUTPUT"
+            tag="${GITHUB_REF_NAME%-}"
+            echo "tag=${tag}" >>"$GITHUB_OUTPUT"
             echo "sha=${{ github.sha }}" >>"$GITHUB_OUTPUT"
           else
             sha="${{ github.event.workflow_run.head_sha }}"
             echo "sha=${sha}" >>"$GITHUB_OUTPUT"
             tag=$(git ls-remote --tags --sort=-v:refname "https://github.com/${GITHUB_REPOSITORY}.git" \
-              | awk '/refs\/tags\/v[0-9]/ {sub("refs\/tags\/","",$2); print $2}' \
+              | awk '/refs\/tags\/v[0-9]/ {sub("refs/tags/","",$2); print $2}' \
               | head -n1)
+            tag="${tag%-}"
             if [ -n "${tag}" ]; then
               echo "tag=${tag}" >>"$GITHUB_OUTPUT"
             else
