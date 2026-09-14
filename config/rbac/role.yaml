@@ -1,0 +1,42 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: cert-manager-ext-issuer-secret-manager
+rules:
+- apiGroups: [""]
+  resources: ["secrets", "events", "namespaces"]
+  verbs: ["get", "list", "watch", "create", "update", "patch"]
+- apiGroups: ["cert-manager.io"]
+  resources: ["certificates", "certificates/status"]
+  verbs: ["get", "list", "watch", "update", "patch"]
+- apiGroups: ["cert-manager.io"]
+  resources: ["certificaterequests", "certificaterequests/status"]
+  verbs: ["get", "list", "watch", "update", "patch"]
+- apiGroups: ["secret-manager.cert-manager.io"]
+  resources:
+    - "awssecretmanagerissuers"
+    - "awssecretmanagerissuers/status"
+    - "awssecretmanagerclusterissuers"
+    - "awssecretmanagerclusterissuers/status"
+    - "gcpsecretmanagerissuers"
+    - "gcpsecretmanagerissuers/status"
+    - "gcpsecretmanagerclusterissuers"
+    - "gcpsecretmanagerclusterissuers/status"
+    - "tencentsecretmanagerissuers"
+    - "tencentsecretmanagerissuers/status"
+    - "tencentsecretmanagerclusterissuers"
+    - "tencentsecretmanagerclusterissuers/status"
+  verbs: ["get", "list", "watch", "update", "patch"]
+# Sign virtual resource: cert-manager performs a SubjectAccessReview on
+# `signers` named <plural>.<group>/<issuer-name> to confirm this controller
+# is allowed to sign CertificateRequests for our third-party issuer types.
+- apiGroups: ["cert-manager.io"]
+  resources: ["signers"]
+  verbs: ["sign"]
+  resourceNames:
+    - "awssecretmanagerissuers.secret-manager.cert-manager.io/*"
+    - "awssecretmanagerclusterissuers.secret-manager.cert-manager.io/*"
+    - "gcpsecretmanagerissuers.secret-manager.cert-manager.io/*"
+    - "gcpsecretmanagerclusterissuers.secret-manager.cert-manager.io/*"
+    - "tencentsecretmanagerissuers.secret-manager.cert-manager.io/*"
+    - "tencentsecretmanagerclusterissuers.secret-manager.cert-manager.io/*"

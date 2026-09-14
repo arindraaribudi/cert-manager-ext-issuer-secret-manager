@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: Secret
+metadata:
+  name: aws-credentials
+  namespace: cert-manager
+type: Opaque
+stringData:
+  aws_access_key_id: REPLACE_ME
+  aws_secret_access_key: REPLACE_ME
+---
+apiVersion: secret-manager.cert-manager.io/v1alpha1
+kind: AWSSecretManagerIssuer
+metadata:
+  name: aws-sample
+  namespace: cert-manager
+spec:
+  region: us-east-1
+  secretRef:
+    name: aws-credentials

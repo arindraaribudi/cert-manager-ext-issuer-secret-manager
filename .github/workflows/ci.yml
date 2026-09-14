@@ -1,0 +1,101 @@
+name: ci
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_run:
+    workflows: ["release"]
+    types: [completed]
+    branches:
+      - "*"
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  docker:
+    name: build + push multi-arch image
+    if: |
+      github.event_name == 'push' ||
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      PLATFORMS: ${{ vars.PLATFORMS || 'linux/amd64' }}
+      IMAGE_NAME: ${{ vars.IMAGE_NAME || format('ghcr.io/{0}', github.repository) }}
+    steps:
+      - name: resolve tag + sha
+        id: resolve
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "push" ]; then
+            tag="${GITHUB_REF_NAME%-}"
+            echo "tag=${tag}" >>"$GITHUB_OUTPUT"
+            echo "sha=${{ github.sha }}" >>"$GITHUB_OUTPUT"
+          else
+            sha="${{ github.event.workflow_run.head_sha }}"
+            echo "sha=${sha}" >>"$GITHUB_OUTPUT"
+            tag=$(git ls-remote --tags --sort=-v:refname "https://github.com/${GITHUB_REPOSITORY}.git" \
+              | grep -oE 'refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$' \
+              | head -n1 \
+              | sed 's|refs/tags/||')
+            if [ -n "${tag}" ]; then
+              echo "tag=${tag}" >>"$GITHUB_OUTPUT"
+            else
+              echo "tag=latest" >>"$GITHUB_OUTPUT"
+            fi
+          fi
+
+      - name: checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.resolve.outputs.sha }}
+
+      - name: set up qemu
+        uses: docker/setup-qemu-action@v3
+
+      - name: set up docker buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: log in to ghcr
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=${{ steps.resolve.outputs.tag }}
+            type=raw,value=latest,enable={{is_default_branch}}
+          flavor: latest=auto
+
+      - name: build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ env.PLATFORMS }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: summary
+        if: always()
+        run: |
+          {
+            echo "### Docker ${{ steps.resolve.outputs.tag }}"
+            echo ""
+            echo "- status: \`${{ job.status }}\`"
+            echo "- image: \`${{ env.IMAGE_NAME }}\`"
+            echo "- tag: \`${{ steps.resolve.outputs.tag }}\`"
+            echo "- sha: \`${{ steps.resolve.outputs.sha }}\`"
+            echo "- trigger: \`${{ github.event_name }}\`"
+          } >>"$GITHUB_STEP_SUMMARY"

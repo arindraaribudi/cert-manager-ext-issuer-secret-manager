@@ -1,0 +1,11 @@
+/bin/
+/dist/
+*.test
+*.out
+.envrc
+.DS_Store
+.claude
+config/install.yaml
+info
+install.yaml
+deploy

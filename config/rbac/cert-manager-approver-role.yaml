@@ -1,0 +1,43 @@
+---
+# Grants cert-manager controller SA permission to APPROVE CertificateRequests
+# targeting this operator's third-party issuers.
+#
+# cert-manager's CertificateRequest approver issues a SubjectAccessReview
+# before approving. It asks: "can user X approve the signer named
+# <plural>.<group>/<issuer-name>?" The webhook rejects with
+#   "does not have permissions to set approved/denied conditions for issuer ..."
+# when the cert-manager SA lacks `approve` on `signers` for the matching
+# resource name. Default cert-manager RBAC only covers the `cert-manager.io`
+# group, so this third-party group (`secret-manager.cert-manager.io`) needs
+# an explicit ClusterRole bound to the cert-manager SA.
+#
+# resourceNames use wildcard suffixes so users don't need to re-apply this
+# role every time they create a new Issuer instance.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: cert-manager-ext-issuer-approver
+rules:
+  - apiGroups: ["cert-manager.io"]
+    resources: ["signers"]
+    verbs: ["approve"]
+    resourceNames:
+      - "gcpsecretmanagerissuers.secret-manager.cert-manager.io/*"
+      - "gcpsecretmanagerclusterissuers.secret-manager.cert-manager.io/*"
+      - "awssecretmanagerissuers.secret-manager.cert-manager.io/*"
+      - "awssecretmanagerclusterissuers.secret-manager.cert-manager.io/*"
+      - "tencentsecretmanagerissuers.secret-manager.cert-manager.io/*"
+      - "tencentsecretmanagerclusterissuers.secret-manager.cert-manager.io/*"
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: cert-manager-ext-issuer-approver
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cert-manager-ext-issuer-approver
+subjects:
+  - kind: ServiceAccount
+    name: cert-manager
+    namespace: cert-manager

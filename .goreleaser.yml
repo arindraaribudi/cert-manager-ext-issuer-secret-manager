@@ -1,0 +1,73 @@
+# yaml-language-server: schema=https://goreleaser.com/static/schema.json
+version: 2
+
+project_name: cert-manager-ext-issuer-secret-manager
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: manager
+    main: ./cmd
+    binary: manager
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
+archives:
+  - id: default
+    formats: [tar.gz]
+    name_template: >-
+      {{ .ProjectName }}_
+      {{- .Version }}_
+      {{- .Os }}_
+      {{- .Arch }}
+    # zip on Windows for native tooling
+    format_overrides:
+      - goos: windows
+        format: zip
+    files:
+      - LICENSE*
+      - README*
+      - config/install.yaml
+
+checksum:
+  name_template: '{{ .ProjectName }}_{{ .Version }}_SHA256SUMS'
+  algorithm: sha256
+
+changelog:
+  use: git
+  sort: asc
+  filters:
+    exclude:
+      - '^docs:'
+      - '^test:'
+      - '^chore:'
+      - '^ci:'
+      - Merge pull request
+      - Merge branch
+
+release:
+  github:
+    owner: arindraaribudi
+    name: cert-manager-ext-issuer-secret-manager
+  draft: false
+  prerelease: auto
+  name_template: '{{ .ProjectName }} v{{ .Version }}'
+  header: |
+    ## {{ .ProjectName }} v{{ .Version }}
+    Released {{ .Date }}.
+  footer: |
+    ## Install
+    ```yaml
+    kubectl apply -f https://github.com/arindraaribudi/cert-manager-ext-issuer-secret-manager/releases/download/v{{ .Version }}/install.yaml
+    ```
+    Binaries + checksums attached.

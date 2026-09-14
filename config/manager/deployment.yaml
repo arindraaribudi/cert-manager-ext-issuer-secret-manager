@@ -1,0 +1,42 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cert-manager-ext-issuer-secret-manager
+  namespace: cert-manager
+  labels:
+    app: cert-manager-ext-issuer-secret-manager
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cert-manager-ext-issuer-secret-manager
+  template:
+    metadata:
+      labels:
+        app: cert-manager-ext-issuer-secret-manager
+    spec:
+      serviceAccountName: cert-manager-ext-issuer-secret-manager
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: manager
+          image: ghcr.io/arindraaribudi/cert-manager-ext-issuer-secret-manager:__IMAGE_TAG__
+          imagePullPolicy: IfNotPresent
+          args:
+            - --leader-elect=false
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+          resources:
+            limits:
+              cpu: 500m
+              memory: 256Mi
+            requests:
+              cpu: 100m
+              memory: 64Mi
