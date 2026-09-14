@@ -104,10 +104,13 @@ func (r *IssuerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 			Name: cert.Spec.SecretName,
 			Annotations: map[string]string{
 				// ponytail: cert-manager refuses to trust an existing Secret
-				// unless they prove it came from the issuer named in the
-				// Certificate spec — otherwise it reports IncorrectIssuer.
-				"cert-manager.io/issuer-name": cert.Spec.IssuerRef.Name,
-				"cert-manager.io/issuer-kind": cert.Spec.IssuerRef.Kind,
+				// unless all three annotations match the Certificate's
+				// IssuerRef — otherwise it reports IncorrectIssuer. A missing
+				// issuer-group defaults to "cert-manager.io", which silently
+				// breaks every external issuer (this project's whole point).
+				"cert-manager.io/issuer-name":  cert.Spec.IssuerRef.Name,
+				"cert-manager.io/issuer-kind":  cert.Spec.IssuerRef.Kind,
+				"cert-manager.io/issuer-group": issuerGroup(cert.Spec.IssuerRef.Group),
 			},
 			OwnerReferences: []metav1.OwnerReference{
 				*metav1.NewControllerRef(&cert, schema.GroupVersionKind{
@@ -216,6 +219,18 @@ func (r *IssuerReconciler) targetNamespaces(ctx context.Context, cert *cmapi.Cer
 		out = append(out, ns.Name)
 	}
 	return out, nil
+}
+
+// issuerGroup returns the group to stamp on the issued Secret. Empty
+// IssuerRef.Group (the cert-manager built-in issuer case) defaults to
+// "cert-manager.io" — that's what cert-manager itself assumes when the
+// annotation is missing, and matching it here keeps the round-trip
+// consistent for both built-in and external issuers.
+func issuerGroup(g string) string {
+	if g == "" {
+		return "cert-manager.io"
+	}
+	return g
 }
 
 // writeSecret creates or updates the given Secret.

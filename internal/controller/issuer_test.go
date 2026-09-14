@@ -201,6 +201,18 @@ func TestReconcile_HappyPath(t *testing.T) {
 		t.Errorf("type = %v, want TLS", sec.Type)
 	}
 
+	// All three issuer-* annotations must be present; missing any one
+	// makes cert-manager report IncorrectIssuer on the next reconcile.
+	if got := sec.Annotations["cert-manager.io/issuer-name"]; got != cert.Spec.IssuerRef.Name {
+		t.Errorf("issuer-name annotation = %q, want %q", got, cert.Spec.IssuerRef.Name)
+	}
+	if got := sec.Annotations["cert-manager.io/issuer-kind"]; got != cert.Spec.IssuerRef.Kind {
+		t.Errorf("issuer-kind annotation = %q, want %q", got, cert.Spec.IssuerRef.Kind)
+	}
+	if got := sec.Annotations["cert-manager.io/issuer-group"]; got != issuerGroup(cert.Spec.IssuerRef.Group) {
+		t.Errorf("issuer-group annotation = %q, want %q", got, issuerGroup(cert.Spec.IssuerRef.Group))
+	}
+
 	// Certificate status: Ready=True, Synced.
 	var got cmapi.Certificate
 	if err := r.Get(context.Background(), types.NamespacedName{Name: "c1", Namespace: "ns1"}, &got); err != nil {
