@@ -7,8 +7,11 @@ package controller
 
 import (
 	"context"
+	"crypto/x509"
+	"encoding/pem"
 	"fmt"
 	"strings"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -16,7 +19,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
-		ctrl "sigs.k8s.io/controller-runtime"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	cmapi "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
@@ -121,6 +124,9 @@ func (r *IssuerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	}
 	if len(parsed.Chain) > 0 {
 		secretTemplate.Data[corev1.ServiceAccountRootCAKey] = parsed.Chain
+	}
+	for k, v := range certAnnotations(parsed.Certificate) {
+		secretTemplate.Annotations[k] = v
 	}
 
 	// 4a. Resolve target namespaces.
@@ -258,6 +264,31 @@ func issuerGroup(g string) string {
 		return "cert-manager.io"
 	}
 	return g
+}
+
+// certAnnotations parses the leaf cert and returns the DNS-names/validity
+// annotations cert-manager itself stamps on Secrets it owns directly
+// (cert-manager.io/{common-name,alt-names,not-before,not-after}). Returns
+// nil on parse failure — these are informational, not required for the
+// Secret to function as TLS material.
+func certAnnotations(certPEM []byte) map[string]string {
+	block, _ := pem.Decode(certPEM)
+	if block == nil {
+		return nil
+	}
+	leaf, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return nil
+	}
+	out := map[string]string{
+		"cert-manager.io/common-name": leaf.Subject.CommonName,
+		"cert-manager.io/not-before":  leaf.NotBefore.UTC().Format(time.RFC3339),
+		"cert-manager.io/not-after":   leaf.NotAfter.UTC().Format(time.RFC3339),
+	}
+	if len(leaf.DNSNames) > 0 {
+		out["cert-manager.io/alt-names"] = strings.Join(leaf.DNSNames, ",")
+	}
+	return out
 }
 
 // writeSecret creates or updates the given Secret.
