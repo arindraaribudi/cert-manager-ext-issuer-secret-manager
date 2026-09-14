@@ -71,7 +71,7 @@ func NewScheme() *runtime.Scheme {
 // and the PayloadKeysFromIssuer callback. Each closure captures the right
 // cloud SDK client for its provider. Resolvers cache clients per region/project
 // (cheap; SDK clients are safe for concurrent use).
-func BuildIssuerResolvers(ctx context.Context, kube client.Client, cmNamespace string) (map[string]controller.SecretResolver, func(ctx context.Context, cert *cmapi.Certificate) (api.PayloadKeys, error)) {
+func BuildIssuerResolvers(ctx context.Context, kube client.Client, cmNamespace string) (map[string]controller.SecretResolver, func(ctx context.Context, cert *cmapi.Certificate) (api.IssuerConfig, error)) {
 	resolvers := map[string]controller.SecretResolver{}
 
 	// AWS resolvers — both Issuer + ClusterIssuer kinds share the same closure.
@@ -88,10 +88,10 @@ func BuildIssuerResolvers(ctx context.Context, kube client.Client, cmNamespace s
 	}
 	resolvers["TencentSecretManagerClusterIssuer"] = resolvers["TencentSecretManagerIssuer"]
 
-	keysFn := func(ctx context.Context, cert *cmapi.Certificate) (api.PayloadKeys, error) {
-		return loadPayloadKeys(ctx, kube, cert, cmNamespace)
+	cfgFn := func(ctx context.Context, cert *cmapi.Certificate) (api.IssuerConfig, error) {
+		return loadIssuerConfig(ctx, kube, cert, cmNamespace)
 	}
-	return resolvers, keysFn
+	return resolvers, cfgFn
 }
 
 func Run(ctx context.Context, opts Options) error {
@@ -109,14 +109,14 @@ func Run(ctx context.Context, opts Options) error {
 		return fmt.Errorf("new manager: %w", err)
 	}
 
-	resolvers, keysFn := BuildIssuerResolvers(ctx, mgr.GetClient(), opts.CertManagerNamespace)
+	resolvers, cfgFn := BuildIssuerResolvers(ctx, mgr.GetClient(), opts.CertManagerNamespace)
 
 	reconciler := &controller.IssuerReconciler{
-		Client:                mgr.GetClient(),
-		Scheme:                mgr.GetScheme(),
-		ProviderResolvers:     resolvers,
-		PayloadKeysFromIssuer: keysFn,
-		CertManagerNamespace:  opts.CertManagerNamespace,
+		Client:                  mgr.GetClient(),
+		Scheme:                  mgr.GetScheme(),
+		ProviderResolvers:       resolvers,
+		IssuerConfigFromIssuer:  cfgFn,
+		CertManagerNamespace:    opts.CertManagerNamespace,
 	}
 
 	if err := ctrl.NewControllerManagedBy(mgr).
@@ -202,51 +202,52 @@ func normalizeGCPVersion(ref string) string {
 	return strings.TrimRight(ref, "/") + "/versions/latest"
 }
 
-// loadPayloadKeys reads the Issuer referenced by cert and returns its PayloadKeys.
-// All 6 kinds share the same Spec shape, so we switch on Kind and read Spec.PayloadKeys.
-// For ClusterIssuer kinds, the namespace is empty (cluster-scoped); cmNamespace is the
-// fallback only when reading SecretRefs — not needed here.
-func loadPayloadKeys(ctx context.Context, kube client.Client, cert *cmapi.Certificate, cmNamespace string) (api.PayloadKeys, error) {
+// loadIssuerConfig reads the Issuer referenced by cert and returns its
+// PayloadKeys + NamespaceFilter. All 6 kinds share the same Spec shape, so
+// we switch on Kind and read Spec. For ClusterIssuer kinds, the namespace is
+// empty (cluster-scoped); cmNamespace is the fallback only when reading
+// SecretRefs — not needed here.
+func loadIssuerConfig(ctx context.Context, kube client.Client, cert *cmapi.Certificate, cmNamespace string) (api.IssuerConfig, error) {
 	_ = cmNamespace
 	ref := cert.Spec.IssuerRef
 	switch ref.Kind {
 	case "AWSSecretManagerIssuer":
 		var iss api.AWSSecretManagerIssuer
 		if err := kube.Get(ctx, types.NamespacedName{Name: ref.Name, Namespace: cert.Namespace}, &iss); err != nil {
-			return api.PayloadKeys{}, fmt.Errorf("get AWSSecretManagerIssuer: %w", err)
+			return api.IssuerConfig{}, fmt.Errorf("get AWSSecretManagerIssuer: %w", err)
 		}
-		return iss.Spec.PayloadKeys, nil
+		return api.IssuerConfig{PayloadKeys: iss.Spec.PayloadKeys, NamespaceFilter: iss.Spec.NamespaceFilter}, nil
 	case "AWSSecretManagerClusterIssuer":
 		var iss api.AWSSecretManagerClusterIssuer
 		if err := kube.Get(ctx, types.NamespacedName{Name: ref.Name}, &iss); err != nil {
-			return api.PayloadKeys{}, fmt.Errorf("get AWSSecretManagerClusterIssuer: %w", err)
+			return api.IssuerConfig{}, fmt.Errorf("get AWSSecretManagerClusterIssuer: %w", err)
 		}
-		return iss.Spec.PayloadKeys, nil
+		return api.IssuerConfig{PayloadKeys: iss.Spec.PayloadKeys, NamespaceFilter: iss.Spec.NamespaceFilter}, nil
 	case "GCPSecretManagerIssuer":
 		var iss api.GCPSecretManagerIssuer
 		if err := kube.Get(ctx, types.NamespacedName{Name: ref.Name, Namespace: cert.Namespace}, &iss); err != nil {
-			return api.PayloadKeys{}, fmt.Errorf("get GCPSecretManagerIssuer: %w", err)
+			return api.IssuerConfig{}, fmt.Errorf("get GCPSecretManagerIssuer: %w", err)
 		}
-		return iss.Spec.PayloadKeys, nil
+		return api.IssuerConfig{PayloadKeys: iss.Spec.PayloadKeys, NamespaceFilter: iss.Spec.NamespaceFilter}, nil
 	case "GCPSecretManagerClusterIssuer":
 		var iss api.GCPSecretManagerClusterIssuer
 		if err := kube.Get(ctx, types.NamespacedName{Name: ref.Name}, &iss); err != nil {
-			return api.PayloadKeys{}, fmt.Errorf("get GCPSecretManagerClusterIssuer: %w", err)
+			return api.IssuerConfig{}, fmt.Errorf("get GCPSecretManagerClusterIssuer: %w", err)
 		}
-		return iss.Spec.PayloadKeys, nil
+		return api.IssuerConfig{PayloadKeys: iss.Spec.PayloadKeys, NamespaceFilter: iss.Spec.NamespaceFilter}, nil
 	case "TencentSecretManagerIssuer":
 		var iss api.TencentSecretManagerIssuer
 		if err := kube.Get(ctx, types.NamespacedName{Name: ref.Name, Namespace: cert.Namespace}, &iss); err != nil {
-			return api.PayloadKeys{}, fmt.Errorf("get TencentSecretManagerIssuer: %w", err)
+			return api.IssuerConfig{}, fmt.Errorf("get TencentSecretManagerIssuer: %w", err)
 		}
-		return iss.Spec.PayloadKeys, nil
+		return api.IssuerConfig{PayloadKeys: iss.Spec.PayloadKeys, NamespaceFilter: iss.Spec.NamespaceFilter}, nil
 	case "TencentSecretManagerClusterIssuer":
 		var iss api.TencentSecretManagerClusterIssuer
 		if err := kube.Get(ctx, types.NamespacedName{Name: ref.Name}, &iss); err != nil {
-			return api.PayloadKeys{}, fmt.Errorf("get TencentSecretManagerClusterIssuer: %w", err)
+			return api.IssuerConfig{}, fmt.Errorf("get TencentSecretManagerClusterIssuer: %w", err)
 		}
-		return iss.Spec.PayloadKeys, nil
+		return api.IssuerConfig{PayloadKeys: iss.Spec.PayloadKeys, NamespaceFilter: iss.Spec.NamespaceFilter}, nil
 	default:
-		return api.PayloadKeys{}, fmt.Errorf("unknown issuer kind %q", ref.Kind)
+		return api.IssuerConfig{}, fmt.Errorf("unknown issuer kind %q", ref.Kind)
 	}
 }

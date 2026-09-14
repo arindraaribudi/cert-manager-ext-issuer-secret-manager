@@ -15,9 +15,10 @@ type GCPSecretManagerIssuer struct {
 }
 
 type GCPSecretManagerIssuerSpec struct {
-	Project     string      `json:"project"`
-	SecretRef   *SecretRef  `json:"secretRef,omitempty"`
-	PayloadKeys PayloadKeys `json:"payloadKeys,omitempty"`
+	Project         string          `json:"project"`
+	SecretRef       *SecretRef      `json:"secretRef,omitempty"`
+	PayloadKeys     PayloadKeys     `json:"payloadKeys,omitempty"`
+	NamespaceFilter NamespaceFilter `json:"namespaceFilter,omitempty"`
 }
 
 type GCPSecretManagerIssuerStatus struct {

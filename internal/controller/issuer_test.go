@@ -126,8 +126,8 @@ func TestReconcile_SourceMissing(t *testing.T) {
 			return nil, errors.New("cloud unreachable")
 		},
 	}
-	r.PayloadKeysFromIssuer = func(ctx context.Context, c *cmapi.Certificate) (api.PayloadKeys, error) {
-		return api.PayloadKeys{}, nil
+	r.IssuerConfigFromIssuer = func(ctx context.Context, c *cmapi.Certificate) (api.IssuerConfig, error) {
+		return api.IssuerConfig{}, nil
 	}
 
 	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "c1", Namespace: "ns1"}}); err != nil {
@@ -178,8 +178,8 @@ func TestReconcile_HappyPath(t *testing.T) {
 			return payload, nil
 		},
 	}
-	r.PayloadKeysFromIssuer = func(ctx context.Context, c *cmapi.Certificate) (api.PayloadKeys, error) {
-		return api.PayloadKeys{}, nil
+	r.IssuerConfigFromIssuer = func(ctx context.Context, c *cmapi.Certificate) (api.IssuerConfig, error) {
+		return api.IssuerConfig{}, nil
 	}
 
 	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "c1", Namespace: "ns1"}}); err != nil {
@@ -263,8 +263,8 @@ func TestReconcile_ClusterIssuerFanOut(t *testing.T) {
 			return payload, nil
 		},
 	}
-	r.PayloadKeysFromIssuer = func(ctx context.Context, c *cmapi.Certificate) (api.PayloadKeys, error) {
-		return api.PayloadKeys{}, nil
+	r.IssuerConfigFromIssuer = func(ctx context.Context, c *cmapi.Certificate) (api.IssuerConfig, error) {
+		return api.IssuerConfig{}, nil
 	}
 
 	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "c1", Namespace: "ns-cert"}}); err != nil {
@@ -282,10 +282,78 @@ func TestReconcile_ClusterIssuerFanOut(t *testing.T) {
 		}
 	}
 
+	// Cert's own namespace must carry the owner ref; others must not
+	// (cross-namespace owner refs get silently garbage-collected by k8s).
+	var secCert corev1.Secret
+	if err := r.Get(context.Background(), types.NamespacedName{Name: "tls-out", Namespace: "ns-cert"}, &secCert); err != nil {
+		t.Fatal(err)
+	}
+	if len(secCert.OwnerReferences) != 1 {
+		t.Errorf("ns-cert: owner refs = %d, want 1", len(secCert.OwnerReferences))
+	}
+	var secA corev1.Secret
+	if err := r.Get(context.Background(), types.NamespacedName{Name: "tls-out", Namespace: "ns-a"}, &secA); err != nil {
+		t.Fatal(err)
+	}
+	if len(secA.OwnerReferences) != 0 {
+		t.Errorf("ns-a: owner refs = %d, want 0", len(secA.OwnerReferences))
+	}
+
 	// Terminating ns must be skipped.
 	var sec corev1.Secret
 	err := r.Get(context.Background(), types.NamespacedName{Name: "tls-out", Namespace: "ns-term"}, &sec)
 	if err == nil {
 		t.Fatal("secret unexpectedly written to terminating namespace")
+	}
+}
+
+func TestReconcile_ClusterIssuerFanOut_NamespaceFilter(t *testing.T) {
+	certPemEscaped := `-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----`
+	keyPemEscaped := `-----BEGIN PRIVATE KEY-----\nMIIE\n-----END PRIVATE KEY-----`
+	payload := []byte(`{"certificate":"` + certPemEscaped + `","private_key":"` + keyPemEscaped + `"}`)
+
+	cert := &cmapi.Certificate{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "c1",
+			Namespace: "ns-cert",
+			Annotations: map[string]string{
+				AnnotationSecretName: "cloud/secret",
+			},
+		},
+		Spec: cmapi.CertificateSpec{
+			IssuerRef:  cmmeta.ObjectReference{Name: "aws-ci", Kind: "AWSSecretManagerClusterIssuer"},
+			SecretName: "tls-out",
+		},
+	}
+	nsCert := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "ns-cert"}}
+	nsA := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "ns-a"}}
+	nsB := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "ns-b"}}
+
+	r := newTestReconciler(t, cert, nsCert, nsA, nsB)
+	r.ProviderResolvers = map[string]SecretResolver{
+		"AWSSecretManagerClusterIssuer": func(ctx context.Context, ref string) ([]byte, error) {
+			return payload, nil
+		},
+	}
+	r.IssuerConfigFromIssuer = func(ctx context.Context, c *cmapi.Certificate) (api.IssuerConfig, error) {
+		return api.IssuerConfig{NamespaceFilter: api.NamespaceFilter{Allow: []string{"ns-a"}}}, nil
+	}
+
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "c1", Namespace: "ns-cert"}}); err != nil {
+		t.Fatalf("Reconcile error: %v", err)
+	}
+
+	// Allow-listed ns must get the secret; cert's own ns is not implicitly
+	// added to an Allow list, so it's skipped here too.
+	var sec corev1.Secret
+	if err := r.Get(context.Background(), types.NamespacedName{Name: "tls-out", Namespace: "ns-a"}, &sec); err != nil {
+		t.Fatalf("secret missing in ns-a: %v", err)
+	}
+
+	for _, ns := range []string{"ns-cert", "ns-b"} {
+		var got corev1.Secret
+		if err := r.Get(context.Background(), types.NamespacedName{Name: "tls-out", Namespace: ns}, &got); err == nil {
+			t.Fatalf("secret unexpectedly written to %s (not in allow-list)", ns)
+		}
 	}
 }

@@ -15,9 +15,10 @@ type TencentSecretManagerIssuer struct {
 }
 
 type TencentSecretManagerIssuerSpec struct {
-	Region      string      `json:"region"`
-	SecretRef   *SecretRef  `json:"secretRef,omitempty"`
-	PayloadKeys PayloadKeys `json:"payloadKeys,omitempty"`
+	Region          string          `json:"region"`
+	SecretRef       *SecretRef      `json:"secretRef,omitempty"`
+	PayloadKeys     PayloadKeys     `json:"payloadKeys,omitempty"`
+	NamespaceFilter NamespaceFilter `json:"namespaceFilter,omitempty"`
 }
 
 type TencentSecretManagerIssuerStatus struct {

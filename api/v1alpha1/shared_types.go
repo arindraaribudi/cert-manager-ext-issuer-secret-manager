@@ -8,6 +8,23 @@ type SecretRef struct {
 	Namespace string `json:"namespace,omitempty"`
 }
 
+// NamespaceFilter controls which namespaces a ClusterIssuer's Secret fans
+// out to. Ignored by namespaced Issuers (always just the Certificate's ns).
+// Allow takes precedence: if non-empty, only listed namespaces are targeted.
+// Otherwise Deny excludes listed namespaces from the fan-out. Neither set
+// (the default) fans out to every non-terminating namespace.
+type NamespaceFilter struct {
+	Allow []string `json:"allow,omitempty"`
+	Deny  []string `json:"deny,omitempty"`
+}
+
+// IssuerConfig bundles the per-Issuer settings the reconciler needs, read
+// once from the Issuer/ClusterIssuer object.
+type IssuerConfig struct {
+	PayloadKeys     PayloadKeys     `json:"payloadKeys,omitempty"`
+	NamespaceFilter NamespaceFilter `json:"namespaceFilter,omitempty"`
+}
+
 // PayloadKeys overrides the JSON keys the controller reads from the
 // cloud-side secret. Defaults: certificate / private_key / certificate_chain.
 type PayloadKeys struct {

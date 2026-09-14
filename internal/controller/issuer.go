@@ -42,11 +42,11 @@ type IssuerReconciler struct {
 	// by internal/app/app.go so this controller stays provider-agnostic.
 	ProviderResolvers map[string]SecretResolver
 
-	// PayloadKeysFromIssuer returns the PayloadKeys for a given IssuerKind +
-	// IssuerName + Certificate namespace. Set at wire-up time. Allows the
-	// reconciler to read configurable field names without knowing the issuer
-	// kind shape.
-	PayloadKeysFromIssuer func(ctx context.Context, cert *cmapi.Certificate) (api.PayloadKeys, error)
+	// IssuerConfigFromIssuer returns the IssuerConfig (PayloadKeys +
+	// NamespaceFilter) for a given IssuerKind + IssuerName + Certificate
+	// namespace. Set at wire-up time. Allows the reconciler to read
+	// configurable settings without knowing the issuer kind shape.
+	IssuerConfigFromIssuer func(ctx context.Context, cert *cmapi.Certificate) (api.IssuerConfig, error)
 
 	// CertManagerNamespace is the fallback ns for ClusterIssuer secretRefs.
 	// ponytail: matches spec §3 — namespaced Issuer resolves empty ns from
@@ -85,13 +85,13 @@ func (r *IssuerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	}
 
 	// 3. Parse payload
-	keys, err := r.PayloadKeysFromIssuer(ctx, &cert)
+	cfg, err := r.IssuerConfigFromIssuer(ctx, &cert)
 	if err != nil {
 		SetReady(&cert, false, "InvalidSpec", err.Error())
 		_ = r.Status().Update(ctx, &cert)
 		return ctrl.Result{}, nil
 	}
-	parsed, err := Extract(payload, keys)
+	parsed, err := Extract(payload, cfg.PayloadKeys)
 	if err != nil {
 		SetReady(&cert, false, "InvalidPayload", err.Error())
 		_ = r.Status().Update(ctx, &cert)
@@ -112,11 +112,6 @@ func (r *IssuerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 				"cert-manager.io/issuer-kind":  cert.Spec.IssuerRef.Kind,
 				"cert-manager.io/issuer-group": issuerGroup(cert.Spec.IssuerRef.Group),
 			},
-			OwnerReferences: []metav1.OwnerReference{
-				*metav1.NewControllerRef(&cert, schema.GroupVersionKind{
-					Group: "cert-manager.io", Version: "v1", Kind: "Certificate",
-				}),
-			},
 		},
 		Type: corev1.SecretTypeTLS,
 		Data: map[string][]byte{
@@ -131,7 +126,7 @@ func (r *IssuerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	// 4a. Resolve target namespaces.
 	// Namespaced Issuer → just the Certificate's ns.
 	// ClusterIssuer-kind → every non-terminating namespace in the cluster.
-	targets, err := r.targetNamespaces(ctx, &cert)
+	targets, err := r.targetNamespaces(ctx, &cert, cfg.NamespaceFilter)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("list namespaces: %w", err)
 	}
@@ -139,6 +134,17 @@ func (r *IssuerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	for _, ns := range targets {
 		secret := secretTemplate.DeepCopy()
 		secret.Namespace = ns
+		// Kubernetes forbids cross-namespace owner references — a namespaced
+		// owner ref to an object in another namespace is treated as absent,
+		// so the GC deletes the dependent right after it's created. Only the
+		// copy in the Certificate's own namespace can carry the owner ref.
+		if ns == cert.Namespace {
+			secret.OwnerReferences = []metav1.OwnerReference{
+				*metav1.NewControllerRef(&cert, schema.GroupVersionKind{
+					Group: "cert-manager.io", Version: "v1", Kind: "Certificate",
+				}),
+			}
+		}
 		if err := r.writeSecret(ctx, secret); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -202,8 +208,10 @@ func (r *IssuerReconciler) lookupResolver(kind string) (SecretResolver, string) 
 
 // targetNamespaces returns the namespaces the cert's TLS Secret should be
 // written into. Namespaced Issuer → just cert.Namespace. ClusterIssuer-kind →
-// every non-terminating namespace in the cluster (fan-out).
-func (r *IssuerReconciler) targetNamespaces(ctx context.Context, cert *cmapi.Certificate) ([]string, error) {
+// every non-terminating namespace in the cluster (fan-out), narrowed by
+// filter.Allow/Deny when set. Allow wins if both are set; neither set means
+// every namespace.
+func (r *IssuerReconciler) targetNamespaces(ctx context.Context, cert *cmapi.Certificate, filter api.NamespaceFilter) ([]string, error) {
 	if !strings.HasSuffix(cert.Spec.IssuerRef.Kind, "ClusterIssuer") {
 		return []string{cert.Namespace}, nil
 	}
@@ -211,14 +219,33 @@ func (r *IssuerReconciler) targetNamespaces(ctx context.Context, cert *cmapi.Cer
 	if err := r.List(ctx, &nsl); err != nil {
 		return nil, err
 	}
+	allow := toSet(filter.Allow)
+	deny := toSet(filter.Deny)
 	out := make([]string, 0, len(nsl.Items))
 	for _, ns := range nsl.Items {
 		if ns.Status.Phase == corev1.NamespaceTerminating {
 			continue
 		}
+		if len(allow) > 0 && !allow[ns.Name] {
+			continue
+		}
+		if len(allow) == 0 && deny[ns.Name] {
+			continue
+		}
 		out = append(out, ns.Name)
 	}
 	return out, nil
+}
+
+func toSet(names []string) map[string]bool {
+	if len(names) == 0 {
+		return nil
+	}
+	set := make(map[string]bool, len(names))
+	for _, n := range names {
+		set[n] = true
+	}
+	return set
 }
 
 // issuerGroup returns the group to stamp on the issued Secret. Empty
