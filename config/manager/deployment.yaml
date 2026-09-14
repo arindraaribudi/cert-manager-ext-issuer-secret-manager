@@ -22,7 +22,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: manager
-          image: cert-manager-ext-issuer-secret-manager:__IMAGE_TAG__
+          image: ghcr.io/arindraaribudi/cert-manager-ext-issuer-secret-manager:__IMAGE_TAG__
           imagePullPolicy: IfNotPresent
           args:
             - --leader-elect=false
