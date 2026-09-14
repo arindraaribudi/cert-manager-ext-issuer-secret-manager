@@ -12,7 +12,7 @@ var (
 )
 
 var (
-	SchemeBuilder = &scheme.Builder{}
+	SchemeBuilder = &scheme.Builder{GroupVersion: SchemeGroupVersion}
 	AddToScheme   = SchemeBuilder.AddToScheme
 )
 
