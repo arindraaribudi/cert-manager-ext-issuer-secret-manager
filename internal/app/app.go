@@ -16,10 +16,13 @@ import (
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	cmapi "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
 
@@ -29,6 +32,24 @@ import (
 
 	secretmanager "cloud.google.com/go/secretmanager/apiv1"
 )
+
+// ourIssuerFilter drops every Certificate event whose IssuerRef.Group isn't
+// ours. Without this the controller wakes up for every cert-manager cert in
+// the cluster (Let’s Encrypt, self-signed, etc.) and does a useless Get +
+// lookupResolver miss on each. ponytail: matches controller.IssuerGroup
+// single source of truth — keep the two in step.
+func ourIssuerFilter() predicate.Funcs {
+	isOurs := func(o client.Object) bool {
+		c, ok := o.(*cmapi.Certificate)
+		return ok && c.Spec.IssuerRef.Group == controller.IssuerGroup
+	}
+	return predicate.Funcs{
+		CreateFunc: func(e event.CreateEvent) bool { return isOurs(e.Object) },
+		UpdateFunc: func(e event.UpdateEvent) bool { return isOurs(e.ObjectNew) },
+		DeleteFunc:  func(e event.DeleteEvent) bool { return false }, // nothing to do on delete
+		GenericFunc: func(e event.GenericEvent) bool { return isOurs(e.Object) },
+	}
+}
 
 type Options struct {
 	MetricsAddr          string
@@ -99,12 +120,16 @@ func Run(ctx context.Context, opts Options) error {
 	}
 
 	if err := ctrl.NewControllerManagedBy(mgr).
-		For(&cmapi.Certificate{}).
+		For(&cmapi.Certificate{}, builder.WithPredicates(ourIssuerFilter())).
 		Complete(reconciler); err != nil {
 		return fmt.Errorf("build controller: %w", err)
 	}
 
-	if err := mgr.Add(&controller.Resyncer{Interval: opts.ResyncInterval}); err != nil {
+	if err := mgr.Add(&controller.Resyncer{
+		Client:    mgr.GetClient(),
+		Reconcile: reconciler.Reconcile,
+		Interval:  opts.ResyncInterval,
+	}); err != nil {
 		return fmt.Errorf("add resyncer: %w", err)
 	}
 
