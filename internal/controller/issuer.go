@@ -102,6 +102,13 @@ func (r *IssuerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	secretTemplate := corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: cert.Spec.SecretName,
+			Annotations: map[string]string{
+				// ponytail: cert-manager refuses to trust an existing Secret
+				// unless they prove it came from the issuer named in the
+				// Certificate spec — otherwise it reports IncorrectIssuer.
+				"cert-manager.io/issuer-name": cert.Spec.IssuerRef.Name,
+				"cert-manager.io/issuer-kind": cert.Spec.IssuerRef.Kind,
+			},
 			OwnerReferences: []metav1.OwnerReference{
 				*metav1.NewControllerRef(&cert, schema.GroupVersionKind{
 					Group: "cert-manager.io", Version: "v1", Kind: "Certificate",
