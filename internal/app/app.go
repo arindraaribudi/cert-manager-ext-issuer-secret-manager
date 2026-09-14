@@ -7,6 +7,8 @@ package app
 import (
 	"context"
 	"fmt"
+	"strings"
+	"sync"
 	"time"
 
 	"k8s.io/apimachinery/pkg/runtime"
@@ -23,6 +25,9 @@ import (
 
 	api "github.com/arindraaribudi/cert-manager-ext-issuer-secret-manager/api/v1alpha1"
 	"github.com/arindraaribudi/cert-manager-ext-issuer-secret-manager/internal/controller"
+	"github.com/arindraaribudi/cert-manager-ext-issuer-secret-manager/internal/gcp"
+
+	secretmanager "cloud.google.com/go/secretmanager/apiv1"
 )
 
 type Options struct {
@@ -138,10 +143,38 @@ func awsResolver(ctx context.Context) controller.SecretResolver {
 }
 
 func gcpResolver(ctx context.Context) controller.SecretResolver {
-	_ = ctx
-	return func(callCtx context.Context, ref string) ([]byte, error) {
-		return nil, fmt.Errorf("gcp: per-cert SecretResolver wiring deferred — see plan §10 self-review")
+	var (
+		once     sync.Once
+		initErr  error
+		smClient *secretmanager.Client
+	)
+	bootstrap := func() {
+		cli, err := gcp.New(ctx, nil)
+		if err != nil {
+			initErr = fmt.Errorf("gcp: new client: %w", err)
+			return
+		}
+		smClient = cli
 	}
+	return func(callCtx context.Context, ref string) ([]byte, error) {
+		once.Do(bootstrap)
+		if initErr != nil {
+			return nil, initErr
+		}
+		return gcp.Fetch(callCtx, smClient, normalizeGCPVersion(ref))
+	}
+}
+
+// normalizeGCPVersion appends /versions/latest to a GCP Secret Manager
+// resource name when no version suffix is present. Accepts either
+// "projects/p/secrets/s" or "projects/p/secrets/s/versions/<x>".
+// ponytail: callers ask "always latest"; appending only when missing keeps
+// pin-to-version support intact.
+func normalizeGCPVersion(ref string) string {
+	if strings.Contains(ref, "/versions/") {
+		return ref
+	}
+	return strings.TrimRight(ref, "/") + "/versions/latest"
 }
 
 // loadPayloadKeys reads the Issuer referenced by cert and returns its PayloadKeys.
