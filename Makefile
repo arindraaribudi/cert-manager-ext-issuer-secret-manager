@@ -56,6 +56,7 @@ bundle: manifests
 	@{ set -- config/crd/bases/*.yaml \
 	           config/manager/namespace.yaml \
 	           config/rbac/role.yaml \
+	           config/rbac/cert-manager-approver-role.yaml \
 	           config/manager/serviceaccount.yaml \
 	           config/manager/role_binding.yaml \
 	           config/manager/deployment.yaml; \

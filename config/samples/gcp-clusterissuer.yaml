@@ -1,0 +1,9 @@
+apiVersion: secret-manager.cert-manager.io/v1alpha1
+kind: GCPSecretManagerClusterIssuer
+metadata:
+  name: gcp-secret-manager
+spec:
+  # project that owns projects/<id>/secrets/...
+  project: "898907061415"
+  # secretRef omitted → uses Workload Identity binding on
+  # cert-manager/cert-manager-ext-issuer-secret-manager KSA

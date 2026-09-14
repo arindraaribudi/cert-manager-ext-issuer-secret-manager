@@ -15,6 +15,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 		ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -133,6 +134,15 @@ func (r *IssuerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		}
 	}
 
+	// 4b. Sign the matching CertificateRequest so cert-manager's issuing
+	// controller can proceed. Best-effort: if no CR exists yet, the issuing
+	// controller will create one on its next reconcile and we'll sign it then.
+	if err := r.signCertificateRequest(ctx, &cert, parsed.Certificate, parsed.Chain); err != nil {
+		SetReady(&cert, false, "SignCRFailed", err.Error())
+		_ = r.Status().Update(ctx, &cert)
+		return ctrl.Result{}, nil
+	}
+
 	// 5. Clear force-sync if set
 	if IsForceSyncSet(&cert) {
 		ClearForceSync(&cert)
@@ -142,6 +152,28 @@ func (r *IssuerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	SetReady(&cert, true, "Synced", "secret reconciled from cloud")
 	_ = r.Status().Update(ctx, &cert)
 	return ctrl.Result{}, nil
+}
+
+// signCertificateRequest finds the CR cert-manager created for this
+// Certificate (named "<cert-name>-<revision>", revision starts at 1) and
+// marks it Ready with the fetched cert bytes. cert-manager's issuing
+// controller then assembles/refreshes the target Secret.
+func (r *IssuerReconciler) signCertificateRequest(ctx context.Context, cert *cmapi.Certificate, certPEM, chainPEM []byte) error {
+	crName := cert.Name + "-1"
+	var cr cmapi.CertificateRequest
+	err := r.Get(ctx, types.NamespacedName{Name: crName, Namespace: cert.Namespace}, &cr)
+	if apierrors.IsNotFound(err) {
+		// CR not created yet — issuing controller will create it; we'll sign on next reconcile.
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("get CertificateRequest %s/%s: %w", cert.Namespace, crName, err)
+	}
+	SetCRReady(&cr, certPEM, chainPEM, "Signed", "signed by cert-manager-ext-issuer-secret-manager")
+	if err := r.Status().Update(ctx, &cr); err != nil {
+		return fmt.Errorf("update CertificateRequest %s/%s status: %w", cert.Namespace, crName, err)
+	}
+	return nil
 }
 
 // lookupResolver returns the registered SecretResolver for the given Kind,
