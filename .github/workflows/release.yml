@@ -166,6 +166,17 @@ jobs:
           # App token bypasses the GITHUB_TOKEN no-trigger rule, so ci.yml fires.
           git push "https://x-access-token:${APP_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "${TAG}"
 
+      - name: install controller-gen
+        run: go install sigs.k8s.io/controller-tools/cmd/controller-gen@v0.18.0
+
+      - name: generate + bundle manifests
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          export PATH="$(go env GOPATH)/bin:${PATH}"
+          make manifests bundle TAG="${TAG}"
+
       - name: stage assets
         run: |
           set -euo pipefail

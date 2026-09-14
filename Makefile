@@ -52,5 +52,15 @@ ci: lint test audit build docker-build trivy
 audit:
 	$(GOVULNCHECK) ./...
 
-bundle:
-	{ cat config/crd/bases/*.yaml; echo '---'; cat config/rbac/role.yaml; } > config/install.yaml
+bundle: manifests
+	@{ set -- config/crd/bases/*.yaml \
+	           config/manager/namespace.yaml \
+	           config/rbac/role.yaml \
+	           config/manager/serviceaccount.yaml \
+	           config/manager/role_binding.yaml \
+	           config/manager/deployment.yaml; \
+	   while [ $$# -gt 0 ]; do \
+	     cat "$$1"; shift; \
+	     if [ $$# -gt 0 ]; then printf '\n---\n'; fi; \
+	   done; \
+	} | sed 's|__IMAGE_TAG__|$(TAG)|g' > config/install.yaml
