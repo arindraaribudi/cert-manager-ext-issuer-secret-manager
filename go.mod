@@ -1,12 +1,17 @@
 module github.com/arindraaribudi/cert-manager-ext-issuer-secret-manager
 
-go 1.26.6
+go 1.27
 
 require (
 	cloud.google.com/go/secretmanager v1.21.0
+	github.com/aws/aws-sdk-go-v2 v1.47.0
 	github.com/aws/aws-sdk-go-v2/config v1.33.3
+	github.com/aws/aws-sdk-go-v2/credentials v1.20.3
+	github.com/aws/aws-sdk-go-v2/service/acm v1.50.0
 	github.com/aws/aws-sdk-go-v2/service/secretsmanager v1.48.0
 	github.com/cert-manager/cert-manager v1.15.3
+	github.com/tencentcloud/tencentcloud-sdk-go-intl-en v3.0.1490+incompatible
+	github.com/youmark/pkcs8 v0.0.0-20240726163527-a2c0da244d78
 	google.golang.org/api v0.297.0
 	k8s.io/api v0.30.3
 	k8s.io/apimachinery v0.30.3
@@ -19,11 +24,9 @@ require (
 	cloud.google.com/go/auth/oauth2adapt v0.2.8 // indirect
 	cloud.google.com/go/compute/metadata v0.9.0 // indirect
 	cloud.google.com/go/iam v1.12.0 // indirect
-	github.com/aws/aws-sdk-go-v2 v1.46.0 // indirect
-	github.com/aws/aws-sdk-go-v2/credentials v1.20.3 // indirect
 	github.com/aws/aws-sdk-go-v2/feature/ec2/imds v1.19.2 // indirect
-	github.com/aws/aws-sdk-go-v2/internal/configsources v1.5.2 // indirect
-	github.com/aws/aws-sdk-go-v2/internal/endpoints/v2 v2.8.2 // indirect
+	github.com/aws/aws-sdk-go-v2/internal/configsources v1.5.3 // indirect
+	github.com/aws/aws-sdk-go-v2/internal/endpoints/v2 v2.8.3 // indirect
 	github.com/aws/aws-sdk-go-v2/internal/v4a v1.5.2 // indirect
 	github.com/aws/aws-sdk-go-v2/service/internal/accept-encoding v1.13.19 // indirect
 	github.com/aws/aws-sdk-go-v2/service/internal/presigned-url v1.14.2 // indirect

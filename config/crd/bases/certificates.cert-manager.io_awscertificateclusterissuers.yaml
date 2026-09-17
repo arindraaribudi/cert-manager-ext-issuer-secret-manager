@@ -4,17 +4,19 @@ kind: CustomResourceDefinition
 metadata:
   annotations:
     controller-gen.kubebuilder.io/version: v0.22.0
-  name: awssecretmanagerissuers.secret-manager.cert-manager.io
+  name: awscertificateclusterissuers.certificates.cert-manager.io
 spec:
-  group: secret-manager.cert-manager.io
+  group: certificates.cert-manager.io
   names:
-    kind: AWSSecretManagerIssuer
-    listKind: AWSSecretManagerIssuerList
-    plural: awssecretmanagerissuers
+    categories:
+    - cert-manager
+    kind: AWSCertificateClusterIssuer
+    listKind: AWSCertificateClusterIssuerList
+    plural: awscertificateclusterissuers
     shortNames:
-    - awssmi
-    singular: awssecretmanagerissuer
-  scope: Namespaced
+    - awscertclusterissuer
+    singular: awscertificateclusterissuer
+  scope: Cluster
   versions:
   - name: v1alpha1
     schema:
@@ -28,27 +30,11 @@ spec:
             type: object
           spec:
             properties:
-              namespaceFilter:
-                properties:
-                  allow:
-                    items:
-                      type: string
-                    type: array
-                  deny:
-                    items:
-                      type: string
-                    type: array
-                type: object
-              payloadKeys:
-                properties:
-                  certificate:
-                    type: string
-                  certificateChain:
-                    type: string
-                  privateKey:
-                    type: string
-                type: object
+              endpoint:
+                type: string
               region:
+                type: string
+              resyncInterval:
                 type: string
               secretRef:
                 properties:

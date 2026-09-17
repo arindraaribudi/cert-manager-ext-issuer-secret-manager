@@ -1,0 +1,7 @@
+apiVersion: certificates.cert-manager.io/v1alpha1
+kind: TencentCertificateClusterIssuer
+metadata:
+  name: example
+spec:
+  region: ap-hongkong
+  resyncInterval: 12h

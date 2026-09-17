@@ -1,0 +1,7 @@
+apiVersion: certificates.cert-manager.io/v1alpha1
+kind: AWSCertificateClusterIssuer
+metadata:
+  name: example
+spec:
+  region: us-east-1
+  resyncInterval: 12h
