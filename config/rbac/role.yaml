@@ -40,3 +40,17 @@ rules:
     - "gcpsecretmanagerclusterissuers.secret-manager.cert-manager.io/*"
     - "tencentsecretmanagerissuers.secret-manager.cert-manager.io/*"
     - "tencentsecretmanagerclusterissuers.secret-manager.cert-manager.io/*"
+- apiGroups: ["certificates.cert-manager.io"]
+  resources:
+    - "awscertificateissuers"
+    - "awscertificateclusterissuers"
+    - "tencentcertificateissuers"
+    - "tencentcertificateclusterissuers"
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: ["certificates.cert-manager.io"]
+  resources:
+    - "awscertificateissuers/status"
+    - "awscertificateclusterissuers/status"
+    - "tencentcertificateissuers/status"
+    - "tencentcertificateclusterissuers/status"
+  verbs: ["get", "update", "patch"]

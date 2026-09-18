@@ -20,6 +20,30 @@ func SetReady(c *cmapi.Certificate, ok bool, reason, msg string) {
 	})
 }
 
+// ConditionTypeExternalIssuerSynced is a custom condition owned by our
+// controllers — cert-manager ignores unknown condition types, so we can
+// flip this without fighting cert-manager's own trigger loop on Ready.
+// Operators read it to detect drift between the configured cloud source
+// and the target Secret.
+const ConditionTypeExternalIssuerSynced cmapi.CertificateConditionType = "ExternalIssuerSynced"
+
+// SetExternalIssuerSynced updates the ExternalIssuerSynced condition.
+// Idempotent via appendOrReplace. Safe to call alongside SetReady; the
+// two conditions carry different intents (cert-manager owns Ready, we
+// own ExternalIssuerSynced).
+func SetExternalIssuerSynced(c *cmapi.Certificate, ok bool, reason, msg string) {
+	status := cmmeta.ConditionFalse
+	if ok {
+		status = cmmeta.ConditionTrue
+	}
+	c.Status.Conditions = appendOrReplace(c.Status.Conditions, cmapi.CertificateCondition{
+		Type:    ConditionTypeExternalIssuerSynced,
+		Status:  status,
+		Reason:  reason,
+		Message: msg,
+	})
+}
+
 // SetCRReady updates the Ready condition on a CertificateRequest and sets
 // the certificate bytes (cert-manager's issuing controller watches CR
 // Ready=True to assemble the target Secret).

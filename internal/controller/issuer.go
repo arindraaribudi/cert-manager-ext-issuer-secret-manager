@@ -6,6 +6,7 @@
 package controller
 
 import (
+	"bytes"
 	"context"
 	"crypto/x509"
 	"encoding/pem"
@@ -26,6 +27,8 @@ import (
 
 	api "github.com/arindraaribudi/cert-manager-ext-issuer-secret-manager/api/v1alpha1"
 )
+
+// RequeueAfterError lives in log.go (shared across reconcilers).
 
 // SecretResolver fetches and returns the raw JSON payload bytes from the
 // configured cloud provider, given a spec + secret-manager-side ref.
@@ -66,39 +69,41 @@ func (r *IssuerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	// 1. Annotation present?
 	ref, ok := SecretName(&cert)
 	if !ok {
-		SetReady(&cert, false, "MissingSecretRef", "annotation cert-manager.io/secret-manager-secret-name is required")
-		_ = r.Status().Update(ctx, &cert)
-		return ctrl.Result{}, nil
+		_ = MarkCertDrift(ctx, r.Client, &cert, "MissingSecretRef", "annotation cert-manager.io/secret-manager-secret-name is required")
+		return RequeueAfterError(ctx, fmt.Errorf("annotation cert-manager.io/secret-manager-secret-name is required"),
+			"secret-manager: missing annotation",
+			"cert", req.String()), nil
 	}
 
 	// 2. Resolve provider + fetch
 	resolver, kind := r.lookupResolver(cert.Spec.IssuerRef.Kind)
 	if resolver == nil {
-		SetReady(&cert, false, "InvalidSpec", fmt.Sprintf("no provider registered for kind %q", cert.Spec.IssuerRef.Kind))
-		_ = r.Status().Update(ctx, &cert)
-		return ctrl.Result{}, nil
+		_ = MarkCertDrift(ctx, r.Client, &cert, "InvalidSpec", fmt.Sprintf("no provider registered for kind %q", cert.Spec.IssuerRef.Kind))
+		return RequeueAfterError(ctx, fmt.Errorf("no provider registered for kind %q", cert.Spec.IssuerRef.Kind),
+			"secret-manager: unknown issuer kind",
+			"cert", req.String(), "issuerRef", fmt.Sprintf("%s/%s", cert.Spec.IssuerRef.Group, cert.Spec.IssuerRef.Kind)), nil
 	}
 	_ = kind
 
 	payload, err := resolver(ctx, ref)
 	if err != nil {
-		SetReady(&cert, false, "SourceMissing", err.Error())
-		_ = r.Status().Update(ctx, &cert)
-		return ctrl.Result{}, nil
+		_ = MarkCertDrift(ctx, r.Client, &cert, "SourceMissing", err.Error())
+		return RequeueAfterError(ctx, err, "secret-manager: fetch payload",
+			"cert", req.String(), "secretRef", ref, "kind", kind), nil
 	}
 
 	// 3. Parse payload
 	cfg, err := r.IssuerConfigFromIssuer(ctx, &cert)
 	if err != nil {
-		SetReady(&cert, false, "InvalidSpec", err.Error())
-		_ = r.Status().Update(ctx, &cert)
-		return ctrl.Result{}, nil
+		_ = MarkCertDrift(ctx, r.Client, &cert, "InvalidSpec", err.Error())
+		return RequeueAfterError(ctx, err, "secret-manager: load issuer config",
+			"cert", req.String()), nil
 	}
 	parsed, err := Extract(payload, cfg.PayloadKeys)
 	if err != nil {
-		SetReady(&cert, false, "InvalidPayload", err.Error())
-		_ = r.Status().Update(ctx, &cert)
-		return ctrl.Result{}, nil
+		_ = MarkCertDrift(ctx, r.Client, &cert, "InvalidPayload", err.Error())
+		return RequeueAfterError(ctx, err, "secret-manager: parse payload",
+			"cert", req.String(), "secretRef", ref, "kind", kind), nil
 	}
 
 	// 4. Build k8s Secret
@@ -125,7 +130,7 @@ func (r *IssuerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	if len(parsed.Chain) > 0 {
 		secretTemplate.Data[corev1.ServiceAccountRootCAKey] = parsed.Chain
 	}
-	for k, v := range certAnnotations(parsed.Certificate) {
+	for k, v := range CertAnnotations(parsed.Certificate) {
 		secretTemplate.Annotations[k] = v
 	}
 
@@ -134,7 +139,9 @@ func (r *IssuerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	// ClusterIssuer-kind → every non-terminating namespace in the cluster.
 	targets, err := r.targetNamespaces(ctx, &cert, cfg.NamespaceFilter)
 	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("list namespaces: %w", err)
+		_ = MarkCertDrift(ctx, r.Client, &cert, "NamespaceListFailed", err.Error())
+		return RequeueAfterError(ctx, fmt.Errorf("list namespaces: %w", err), "secret-manager: list namespaces",
+			"cert", req.String()), nil
 	}
 
 	for _, ns := range targets {
@@ -152,7 +159,9 @@ func (r *IssuerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 			}
 		}
 		if err := r.writeSecret(ctx, secret); err != nil {
-			return ctrl.Result{}, err
+			_ = MarkCertDrift(ctx, r.Client, &cert, "SecretWriteFailed", err.Error())
+			return RequeueAfterError(ctx, err, "secret-manager: write secret",
+				"cert", req.String(), "namespace", ns, "secretName", cert.Spec.SecretName), nil
 		}
 	}
 
@@ -160,9 +169,9 @@ func (r *IssuerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	// controller can proceed. Best-effort: if no CR exists yet, the issuing
 	// controller will create one on its next reconcile and we'll sign it then.
 	if err := r.signCertificateRequest(ctx, &cert, parsed.Certificate, parsed.Chain); err != nil {
-		SetReady(&cert, false, "SignCRFailed", err.Error())
-		_ = r.Status().Update(ctx, &cert)
-		return ctrl.Result{}, nil
+		_ = MarkCertDrift(ctx, r.Client, &cert, "SignCRFailed", err.Error())
+		return RequeueAfterError(ctx, err, "secret-manager: sign CertificateRequest",
+			"cert", req.String()), nil
 	}
 
 	// 5. Clear force-sync if set
@@ -171,9 +180,23 @@ func (r *IssuerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		_ = r.Update(ctx, &cert)
 	}
 
-	SetReady(&cert, true, "Synced", "secret reconciled from cloud")
-	_ = r.Status().Update(ctx, &cert)
+	_ = ClearCertDrift(ctx, r.Client, &cert, "Synced", "secret reconciled from cloud")
+	if err := r.setReady(ctx, &cert, true, "Synced", "secret reconciled from cloud"); err != nil {
+		return RequeueAfterError(ctx, err, "secret-manager: setReady Synced",
+			"cert", req.String()), nil
+	}
 	return ctrl.Result{}, nil
+}
+
+// setReady updates the Ready condition via a merge patch on the status
+// subresource. Patches don't bump the main resourceVersion, so cert-manager's
+// trigger-loop Update on the same Certificate won't race with us on
+// optimistic locking — same fix as tencentcert + awscert controllers. Kills
+// the per-minute Ready False→True churn in cert-manager core.
+func (r *IssuerReconciler) setReady(ctx context.Context, cert *cmapi.Certificate, ok bool, reason, msg string) error {
+	original := cert.DeepCopy()
+	SetReady(cert, ok, reason, msg)
+	return r.Status().Patch(ctx, cert, client.MergeFrom(original))
 }
 
 // signCertificateRequest finds the CR cert-manager created for this
@@ -218,11 +241,18 @@ func (r *IssuerReconciler) lookupResolver(kind string) (SecretResolver, string) 
 // filter.Allow/Deny when set. Allow wins if both are set; neither set means
 // every namespace.
 func (r *IssuerReconciler) targetNamespaces(ctx context.Context, cert *cmapi.Certificate, filter api.NamespaceFilter) ([]string, error) {
+	return TargetNamespaces(ctx, r.Client, cert, filter)
+}
+
+// TargetNamespaces is the package-level fan-out helper. Exported so the
+// awscert + tencentcert controllers can reuse the same logic. See method
+// for behavior.
+func TargetNamespaces(ctx context.Context, c client.Client, cert *cmapi.Certificate, filter api.NamespaceFilter) ([]string, error) {
 	if !strings.HasSuffix(cert.Spec.IssuerRef.Kind, "ClusterIssuer") {
 		return []string{cert.Namespace}, nil
 	}
 	var nsl corev1.NamespaceList
-	if err := r.List(ctx, &nsl); err != nil {
+	if err := c.List(ctx, &nsl); err != nil {
 		return nil, err
 	}
 	allow := toSet(filter.Allow)
@@ -271,7 +301,7 @@ func issuerGroup(g string) string {
 // (cert-manager.io/{common-name,alt-names,not-before,not-after}). Returns
 // nil on parse failure — these are informational, not required for the
 // Secret to function as TLS material.
-func certAnnotations(certPEM []byte) map[string]string {
+func CertAnnotations(certPEM []byte) map[string]string {
 	block, _ := pem.Decode(certPEM)
 	if block == nil {
 		return nil
@@ -293,11 +323,159 @@ func certAnnotations(certPEM []byte) map[string]string {
 
 // writeSecret creates or updates the given Secret.
 func (r *IssuerReconciler) writeSecret(ctx context.Context, secret *corev1.Secret) error {
-	if err := r.Update(ctx, secret); err != nil {
-		if apierrors.IsNotFound(err) {
-			return r.Create(ctx, secret)
-		}
-		return fmt.Errorf("update secret %s/%s: %w", secret.Namespace, secret.Name, err)
+	return WriteSecret(ctx, r.Client, secret)
+}
+
+// WriteSecret creates or updates the given Secret, but skips the API call
+// when the existing Secret already carries the same Data + Annotations + Type.
+// Exported so awscert + tencentcert can reuse.
+//
+// ponytail: the unconditional Update pattern bumps Secret.resourceVersion every
+// reconcile even when nothing changed. cert-manager core watches Secrets and
+// re-enqueues the owning Certificate on rv bump — its trigger-loop then
+// flips Ready False→True every minute (conditions.go:201 spam). Comparing
+// payload bytes before the Patch makes the reconcile a true no-op when the
+// cloud cert hasn't rotated.
+func WriteSecret(ctx context.Context, c client.Client, secret *corev1.Secret) error {
+	existing := &corev1.Secret{}
+	err := c.Get(ctx, client.ObjectKeyFromObject(secret), existing)
+	if apierrors.IsNotFound(err) {
+		return c.Create(ctx, secret)
 	}
-	return nil
+	if err != nil {
+		return fmt.Errorf("get secret %s/%s: %w", secret.Namespace, secret.Name, err)
+	}
+	if secretPayloadEqual(existing, secret) {
+		return nil
+	}
+	// Apply desired state onto the existing object (preserves rv + uid +
+	// non-listed fields), then merge-patch. JSON merge replaces annotations
+	// and data wholesale on Secrets — fine, that's what we want here.
+	original := existing.DeepCopy()
+	existing.Data = secret.Data
+	existing.Type = secret.Type
+	existing.Annotations = secret.Annotations
+	existing.Labels = secret.Labels
+	if len(secret.OwnerReferences) > 0 {
+		existing.OwnerReferences = secret.OwnerReferences
+	}
+	return c.Patch(ctx, existing, client.MergeFrom(original))
+}
+
+// secretPayloadEqual reports whether two Secrets carry the same payload that
+// cert-manager (and consumers) actually read. resourceVersion, uid, labels
+// and managedFields intentionally ignored.
+
+// Drift annotations stamped on the target Secret when the cloud source is
+// unreachable. cert-manager owns the Secret payload (we write it), but we
+// own these three annotations — they let operators see drift without us
+// deleting the Secret and breaking consumers that mount it.
+const (
+	AnnotationExternalIssuerDriftReason  = "external-issuer.cert-manager.io/drift-reason"
+	AnnotationExternalIssuerDriftMessage = "external-issuer.cert-manager.io/drift-message"
+	AnnotationExternalIssuerDriftAt      = "external-issuer.cert-manager.io/drift-at"
+)
+
+// MarkSecretDrift stamps the target Secret with the last source error so
+// operators see drift without us removing it (and breaking any Deployment
+// or Ingress mounting it). No-op when annotations already match the new
+// error — avoids Secret rv bumps and cert-manager trigger storms. Returns
+// nil on a missing Secret (nothing to mark).
+
+// markCertDrift records drift on both the Secret (annotations) and the
+// Certificate (ExternalIssuerSynced=False condition) so operators see it
+// from either side. One helper per error path keeps call-sites to a
+// single line. Returns the first error from either operation; callers
+// decide whether to log/swallow.
+func MarkCertDrift(ctx context.Context, c client.Client, cert *cmapi.Certificate, reason, msg string) error {
+	if err := MarkSecretDrift(ctx, c, cert, reason, msg); err != nil {
+		return err
+	}
+	original := cert.DeepCopy()
+	SetExternalIssuerSynced(cert, false, reason, msg)
+	return c.Status().Patch(ctx, cert, client.MergeFrom(original))
+}
+
+// clearCertDrift removes drift markers after a successful sync. Both the
+// Secret annotations and the Certificate condition are reset. Pair this
+// with setReady(True) so Ready and ExternalIssuerSynced agree.
+func ClearCertDrift(ctx context.Context, c client.Client, cert *cmapi.Certificate, reason, msg string) error {
+	if err := clearSecretDrift(ctx, c, cert); err != nil {
+		return err
+	}
+	original := cert.DeepCopy()
+	SetExternalIssuerSynced(cert, true, reason, msg)
+	return c.Status().Patch(ctx, cert, client.MergeFrom(original))
+}
+func MarkSecretDrift(ctx context.Context, c client.Client, cert *cmapi.Certificate, reason, msg string) error {
+	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{
+		Name:      cert.Spec.SecretName,
+		Namespace: cert.Namespace,
+	}}
+	if err := c.Get(ctx, client.ObjectKeyFromObject(secret), secret); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("get secret %s/%s: %w", secret.Namespace, secret.Name, err)
+	}
+	if secret.Annotations[AnnotationExternalIssuerDriftReason] == reason &&
+		secret.Annotations[AnnotationExternalIssuerDriftMessage] == msg {
+		return nil
+	}
+	original := secret.DeepCopy()
+	if secret.Annotations == nil {
+		secret.Annotations = map[string]string{}
+	}
+	secret.Annotations[AnnotationExternalIssuerDriftReason] = reason
+	secret.Annotations[AnnotationExternalIssuerDriftMessage] = msg
+	secret.Annotations[AnnotationExternalIssuerDriftAt] = time.Now().UTC().Format(time.RFC3339)
+	return c.Patch(ctx, secret, client.MergeFrom(original))
+}
+
+// ClearSecretDrift removes the three drift annotations after a successful
+// sync. No-op when none are present, so we don't patch on every reconcile.
+func clearSecretDrift(ctx context.Context, c client.Client, cert *cmapi.Certificate) error {
+	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{
+		Name:      cert.Spec.SecretName,
+		Namespace: cert.Namespace,
+	}}
+	if err := c.Get(ctx, client.ObjectKeyFromObject(secret), secret); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("get secret %s/%s: %w", secret.Namespace, secret.Name, err)
+	}
+	if _, ok := secret.Annotations[AnnotationExternalIssuerDriftReason]; !ok {
+		return nil
+	}
+	original := secret.DeepCopy()
+	delete(secret.Annotations, AnnotationExternalIssuerDriftReason)
+	delete(secret.Annotations, AnnotationExternalIssuerDriftMessage)
+	delete(secret.Annotations, AnnotationExternalIssuerDriftAt)
+	return c.Patch(ctx, secret, client.MergeFrom(original))
+}
+
+func secretPayloadEqual(a, b *corev1.Secret) bool {
+	if a.Type != b.Type {
+		return false
+	}
+	if !bytes.Equal(a.Data[corev1.TLSCertKey], b.Data[corev1.TLSCertKey]) {
+		return false
+	}
+	if !bytes.Equal(a.Data[corev1.TLSPrivateKeyKey], b.Data[corev1.TLSPrivateKeyKey]) {
+		return false
+	}
+	if ca, ok := a.Data[corev1.ServiceAccountRootCAKey]; ok {
+		if !bytes.Equal(ca, b.Data[corev1.ServiceAccountRootCAKey]) {
+			return false
+		}
+	} else if _, ok := b.Data[corev1.ServiceAccountRootCAKey]; ok {
+		return false
+	}
+	for k, v := range b.Annotations {
+		if a.Annotations[k] != v {
+			return false
+		}
+	}
+	return true
 }

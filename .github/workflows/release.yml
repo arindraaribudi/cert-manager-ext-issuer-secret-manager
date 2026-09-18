@@ -33,58 +33,143 @@ permissions:
   contents: write
 
 jobs:
-  preflight:
-    name: lint + test + build
+  govulncheck:
+    name: govulncheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 1
+
+      - uses: actions/setup-go@v7.0.0
+        with:
+          go-version: "1.27.1"
+          cache: true
+
+      - uses: actions/cache@v5
+        id: cache-govulncheck
+        # ponytail: v1.1.4 ships x/tools v0.29.0; SSA builder panics on Go 1.27 AST
+        # (*ast.KeyValueExpr). Pin to master commit 7090154 (bumped to x/tools v0.50.0).
+        # Bump to a tagged release once v1.1.5+ ships.
+        with:
+          path: ~/go/bin/govulncheck
+          key: govulncheck-7090154-${{ runner.os }}
+
+      - name: install govulncheck
+        if: steps.cache-govulncheck.outputs.cache-hit != 'true'
+        run: go install golang.org/x/vuln/cmd/govulncheck@709015412431dd2b5b28a53c06c70bc02d49074c
+
+      - run: |
+          "$(go env GOPATH)/bin/govulncheck" ./...
+
+  lint:
+    name: golangci-lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 1
+
+      - uses: actions/setup-go@v7.0.0
+        with:
+          go-version: "1.27.1"
+          cache: true
+
+      - uses: actions/cache@v5
+        id: cache-golangci-lint
+        with:
+          path: ~/go/bin/golangci-lint
+          key: golangci-lint-v2.13.2-${{ runner.os }}
+
+      - name: install golangci-lint
+        if: steps.cache-golangci-lint.outputs.cache-hit != 'true'
+        run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.2
+
+      - uses: actions/cache@v5
+        with:
+          path: ~/.cache/golangci-lint
+          key: golangci-lint-run-${{ runner.os }}-${{ hashFiles('go.sum', 'Makefile') }}
+          restore-keys: |
+            golangci-lint-run-${{ runner.os }}-
+
+      - run: |
+          "$(go env GOPATH)/bin/golangci-lint" run --timeout=5m ./...
+
+  test:
+    name: go test
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
       contents: read
     steps:
-      - name: checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
         with:
-          fetch-depth: 0
+          fetch-depth: 1
 
-      - name: setup-go
-        uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7.0.0
         with:
-          go-version: "1.26.3"
+          go-version: "1.27.1"
           cache: true
 
-      - name: security audit
-        run: |
-          go install golang.org/x/vuln/cmd/govulncheck@latest
-          "$(go env GOPATH)/bin/govulncheck" ./...
-
-      - name: golangci-lint
-        uses: golangci/golangci-lint-action@v8
+      - uses: actions/cache@v5
         with:
-          version: v2.13.2
-          node-version: 24
-          args: --timeout=5m
+          path: ~/.cache/go-build
+          key: go-build-${{ runner.os }}-${{ hashFiles('go.sum') }}
+          restore-keys: |
+            go-build-${{ runner.os }}-
 
-      - name: go test
-        run: go test ./...
+      - run: go test ./...
 
-      - name: go build
-        run: CGO_ENABLED=0 go build -o /tmp/manager-build ./cmd
+  build:
+    name: go build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 1
+
+      - uses: actions/setup-go@v7.0.0
+        with:
+          go-version: "1.27.1"
+          cache: true
+
+      - uses: actions/cache@v5
+        with:
+          path: ~/.cache/go-build
+          key: go-build-${{ runner.os }}-${{ hashFiles('go.sum') }}
+          restore-keys: |
+            go-build-${{ runner.os }}-
+
+      - run: CGO_ENABLED=0 go build -o /tmp/manager-build ./cmd
 
   release:
     name: release
     runs-on: ubuntu-latest
-    needs: preflight
+    needs: [govulncheck, lint, test, build]
     timeout-minutes: 30
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
     steps:
       - name: checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: setup-go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7.0.0
         with:
-          go-version: "1.26.3"
+          go-version: "1.27.1"
+          cache: true
 
       - name: resolve version
         id: version
@@ -92,10 +177,11 @@ jobs:
           BUMP: ${{ inputs.bump }}
           CUSTOM: ${{ inputs.custom_version }}
           PREFIX: ${{ inputs.tag_prefix }}
+          PRERELEASE: ${{ inputs.prerelease }}
         run: |
           set -euo pipefail
-          # Semver: MAJOR.MINOR.PATCH (no leading 'v'); tag = "<prefix><ver>"
-          semver_re='^([0-9]+)\.([0-9]+)\.([0-9]+)$'
+          # Semver with optional prerelease suffix, e.g. 0.2.0 or 0.2.0-rc1
+          semver_re='^([0-9]+)\.([0-9]+)\.([0-9]+)(-[a-zA-Z0-9.]+)?$'
 
           git fetch --tags --force
 
@@ -124,7 +210,7 @@ jobs:
             if [[ "${CUSTOM}" =~ ${semver_re} ]]; then
               next="${CUSTOM}"
             else
-              echo "::error::custom_version '${CUSTOM}' is not semver MAJOR.MINOR.PATCH." >&2
+              echo "::error::custom_version '${CUSTOM}' is not semver MAJOR.MINOR.PATCH[-suffix]." >&2
               exit 1
             fi
           else
@@ -136,6 +222,16 @@ jobs:
             esac
           fi
 
+          # Append -rcN suffix when prerelease=true; auto-increments if base+rcN tag exists.
+          # Skip when bump=custom — user controls the suffix in custom_version.
+          if [ "${PRERELEASE}" = "true" ] && [ "${BUMP}" != "custom" ]; then
+            rc_n=1
+            while git rev-parse -q --verify "refs/tags/${PREFIX}${next}-rc${rc_n}" >/dev/null; do
+              rc_n=$((rc_n + 1))
+            done
+            next="${next}-rc${rc_n}"
+          fi
+
           tag="${PREFIX}${next}"
           if git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
             echo "::error::Tag '${tag}' already exists." >&2
@@ -144,29 +240,17 @@ jobs:
 
           echo "version=${next}" >>"${GITHUB_OUTPUT}"
           echo "tag=${tag}" >>"${GITHUB_OUTPUT}"
-          echo "Resolved ${tag} (current was ${current}, bump=${BUMP})."
+          echo "Resolved ${tag} (current was ${current}, bump=${BUMP}, prerelease=${PRERELEASE})."
 
-      - name: mint app token
-        id: app
-        uses: actions/create-github-app-token@v2
+      - name: cache controller-gen
+        id: cache-controller-gen
+        uses: actions/cache@v5
         with:
-          app-id: ${{ vars.APP_ID }}
-          private-key: ${{ secrets.APP_PRIVATE_KEY }}
-          permission-contents: write
-
-      - name: create + push tag
-        env:
-          TAG: ${{ steps.version.outputs.tag }}
-          APP_TOKEN: ${{ steps.app.outputs.token }}
-        run: |
-          set -euo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git tag -a "${TAG}" -m "Release ${TAG}"
-          # App token bypasses the GITHUB_TOKEN no-trigger rule, so ci.yml fires.
-          git push "https://x-access-token:${APP_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "${TAG}"
+          path: ~/go/bin/controller-gen
+          key: controller-gen-v0.18.0-${{ runner.os }}
 
       - name: install controller-gen
+        if: steps.cache-controller-gen.outputs.cache-hit != 'true'
         run: go install sigs.k8s.io/controller-tools/cmd/controller-gen@v0.18.0
 
       - name: generate + bundle manifests
@@ -185,7 +269,7 @@ jobs:
           ls -la /tmp/release
 
       - name: create github release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3.0.3
         with:
           tag_name: ${{ steps.version.outputs.tag }}
           generate_release_notes: true
@@ -209,6 +293,20 @@ jobs:
             echo ""
             echo "- bump: \`${{ inputs.bump }}\`"
             echo "- prerelease: \`${{ inputs.prerelease }}\`"
-            echo "- preflight: \`${{ needs.preflight.result }}\`"
+            echo "- govulncheck: \`${{ needs.govulncheck.result }}\`"
+            echo "- lint: \`${{ needs.lint.result }}\`"
+            echo "- test: \`${{ needs.test.result }}\`"
+            echo "- build: \`${{ needs.build.result }}\`"
             echo "- release: \`${{ job.status }}\`"
           } >>"$GITHUB_STEP_SUMMARY"
+
+  build-ci:
+    name: build + push image
+    needs: release
+    if: needs.release.result == 'success'
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/ci.yml
+    with:
+      tag: ${{ needs.release.outputs.tag }}

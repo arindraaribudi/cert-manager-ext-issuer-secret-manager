@@ -27,10 +27,19 @@ import (
 	cmapi "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
 
 	api "github.com/arindraaribudi/cert-manager-ext-issuer-secret-manager/api/v1alpha1"
+	certapi "github.com/arindraaribudi/cert-manager-ext-issuer-secret-manager/api/certificates/v1alpha1"
+	awscertpkg "github.com/arindraaribudi/cert-manager-ext-issuer-secret-manager/internal/awscert"
 	"github.com/arindraaribudi/cert-manager-ext-issuer-secret-manager/internal/controller"
+	awscertctrl "github.com/arindraaribudi/cert-manager-ext-issuer-secret-manager/internal/controller/awscert"
+	tencentcertctrl "github.com/arindraaribudi/cert-manager-ext-issuer-secret-manager/internal/controller/tencentcert"
 	"github.com/arindraaribudi/cert-manager-ext-issuer-secret-manager/internal/gcp"
+	"github.com/arindraaribudi/cert-manager-ext-issuer-secret-manager/internal/tencentcert"
 
+	"github.com/aws/aws-sdk-go-v2/service/acm"
 	secretmanager "cloud.google.com/go/secretmanager/apiv1"
+	tccommon "github.com/tencentcloud/tencentcloud-sdk-go-intl-en/tencentcloud/common"
+	tcprofile "github.com/tencentcloud/tencentcloud-sdk-go-intl-en/tencentcloud/common/profile"
+	tcssl "github.com/tencentcloud/tencentcloud-sdk-go-intl-en/tencentcloud/ssl/v20191205"
 )
 
 // ourIssuerFilter drops every Certificate event whose IssuerRef.Group isn't
@@ -64,6 +73,7 @@ func NewScheme() *runtime.Scheme {
 	utilruntime.Must(clientgoscheme.AddToScheme(s))
 	utilruntime.Must(cmapi.AddToScheme(s))
 	utilruntime.Must(api.AddToScheme(s))
+	utilruntime.Must(certapi.AddToScheme(s))
 	return s
 }
 
@@ -123,6 +133,24 @@ func Run(ctx context.Context, opts Options) error {
 		For(&cmapi.Certificate{}, builder.WithPredicates(ourIssuerFilter())).
 		Complete(reconciler); err != nil {
 		return fmt.Errorf("build controller: %w", err)
+	}
+
+	awsCertRec := &awscertctrl.IssuerReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+		NewACM: newACMClient,
+	}
+	if err := awsCertRec.SetupWithManager(mgr); err != nil {
+		return fmt.Errorf("setup awscert controller: %w", err)
+	}
+
+	tcCertRec := &tencentcertctrl.IssuerReconciler{
+		Client:       mgr.GetClient(),
+		Scheme:       mgr.GetScheme(),
+		NewSSLClient: newTencentSSLClient,
+	}
+	if err := tcCertRec.SetupWithManager(mgr); err != nil {
+		return fmt.Errorf("setup tencentcert controller: %w", err)
 	}
 
 	if err := mgr.Add(&controller.Resyncer{
@@ -250,4 +278,34 @@ func loadIssuerConfig(ctx context.Context, kube client.Client, cert *cmapi.Certi
 	default:
 		return api.IssuerConfig{}, fmt.Errorf("unknown issuer kind %q", ref.Kind)
 	}
+}
+
+// newACMClient builds an AWS ACM client. Region comes from the Issuer spec;
+// optional endpoint override supports VPC endpoint testing. Ponytail:
+// credential chain (IRSA / env / EC2) is the SDK's default — no custom
+// plumbing needed here.
+func newACMClient(ctx context.Context, region, endpoint string) (*acm.Client, error) {
+	cfg, err := awscertpkg.BuildCredentialConfig(ctx, region)
+	if err != nil {
+		return nil, err
+	}
+	if endpoint != "" {
+		cfg.BaseEndpoint = &endpoint
+	}
+	return acm.NewFromConfig(cfg), nil
+}
+
+// newTencentSSLClient builds a Tencent SSL client. Endpoint defaults to the
+// public ssl.tencentcloudapi.com; spec.Endpoint can override for testing.
+func newTencentSSLClient(creds tccommon.CredentialIface, region, endpoint string) (*tencentcert.SSLClient, error) {
+	if endpoint == "" {
+		endpoint = "ssl.tencentcloudapi.com"
+	}
+	prof := tcprofile.NewClientProfile()
+	prof.HttpProfile.Endpoint = endpoint
+	cli, err := tcssl.NewClient(creds, region, prof)
+	if err != nil {
+		return nil, err
+	}
+	return tencentcert.New(cli), nil
 }

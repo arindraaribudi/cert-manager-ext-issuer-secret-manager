@@ -28,6 +28,8 @@ rules:
       - "awssecretmanagerclusterissuers.secret-manager.cert-manager.io/*"
       - "tencentsecretmanagerissuers.secret-manager.cert-manager.io/*"
       - "tencentsecretmanagerclusterissuers.secret-manager.cert-manager.io/*"
+      - "tencentcertificateissuers.certificates.cert-manager.io/*"
+      - "tencentcertificateclusterissuers.certificates.cert-manager.io/*"
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
