@@ -12,7 +12,6 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/service/acm"
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -23,6 +22,7 @@ import (
 	cmapi "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
 
 	certapi "github.com/arindraaribudi/cert-manager-ext-issuer-secret-manager/api/certificates/v1alpha1"
+	api "github.com/arindraaribudi/cert-manager-ext-issuer-secret-manager/api/v1alpha1"
 	"github.com/arindraaribudi/cert-manager-ext-issuer-secret-manager/internal/awscert"
 	controller "github.com/arindraaribudi/cert-manager-ext-issuer-secret-manager/internal/controller"
 )
@@ -41,6 +41,17 @@ type IssuerReconciler struct {
 }
 
 func ptr[T any](v T) *T { return &v }
+
+// setReady updates the Ready condition via a merge patch on the status
+// subresource. Patches don't bump the main resourceVersion, so cert-manager's
+// trigger-loop Update on the same Certificate won't race with us on
+// optimistic locking — same fix as tencentcert/setReady. Kills the per-minute
+// Ready False→True churn in cert-manager core.
+func (r *IssuerReconciler) setReady(ctx context.Context, cert *cmapi.Certificate, ok bool, reason, msg string) error {
+	original := cert.DeepCopy()
+	controller.SetReady(cert, ok, reason, msg)
+	return r.Status().Patch(ctx, cert, client.MergeFrom(original))
+}
 
 // hasARNAnnotation reports whether the Certificate carries our annotation.
 func hasARNAnnotation(obj client.Object) bool {
@@ -117,50 +128,53 @@ func (r *IssuerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 
 	spec, ns, err := r.resolveIssuer(ctx, &cert)
 	if err != nil {
-		controller.SetReady(&cert, false, "IssuerNotFound", err.Error())
-		_ = r.Status().Update(ctx, &cert)
-		return ctrl.Result{}, err
+		_ = controller.MarkCertDrift(ctx, r.Client, &cert, "IssuerNotFound", err.Error())
+		return controller.RequeueAfterError(ctx, err, "awscert: resolve issuer",
+			"cert", req.String(), "issuerRef", fmt.Sprintf("%s/%s/%s", cert.Spec.IssuerRef.Group, cert.Spec.IssuerRef.Kind, cert.Spec.IssuerRef.Name)), nil
 	}
 
 	passphrase, err := r.loadCredentials(ctx, spec, ns)
 	if err != nil {
-		controller.SetReady(&cert, false, "MissingCredentials", err.Error())
-		_ = r.Status().Update(ctx, &cert)
-		return ctrl.Result{}, err
+		_ = controller.MarkCertDrift(ctx, r.Client, &cert, "MissingCredentials", err.Error())
+		return controller.RequeueAfterError(ctx, err, "awscert: load credentials",
+			"cert", req.String()), nil
 	}
 	acmClient, err := r.NewACM(ctx, spec.Region, spec.Endpoint)
 	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("awscert: new client: %w", err)
+		_ = controller.MarkCertDrift(ctx, r.Client, &cert, "ClientBuildFailed", err.Error())
+		return controller.RequeueAfterError(ctx, fmt.Errorf("awscert: new client: %w", err), "awscert: build ACM client",
+			"cert", req.String(), "region", spec.Region), nil
 	}
 	cl := awscert.New(acmClient)
 
 	raw, err := cl.Export(ctx, arn, passphrase)
 	if err != nil {
-		controller.SetReady(&cert, false, "DownloadFailed", err.Error())
-		_ = r.Status().Update(ctx, &cert)
-		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+		_ = controller.MarkCertDrift(ctx, r.Client, &cert, "DownloadFailed", err.Error())
+		return controller.RequeueAfterError(ctx, err, "awscert: export certificate",
+			"cert", req.String(), "arn", arn, "region", spec.Region), nil
 	}
 
 	chain, encKey, err := awscert.SplitPEM(raw)
 	if err != nil {
-		controller.SetReady(&cert, false, "DownloadFailed", err.Error())
-		_ = r.Status().Update(ctx, &cert)
-		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+		_ = controller.MarkCertDrift(ctx, r.Client, &cert, "DownloadFailed", err.Error())
+		return controller.RequeueAfterError(ctx, err, "awscert: split PEM",
+			"cert", req.String(), "arn", arn), nil
 	}
 	var key []byte
 	if len(encKey) > 0 {
 		key, err = awscert.DecryptPKCS8(encKey, passphrase)
 		if err != nil {
-			controller.SetReady(&cert, false, "DecryptFailed", err.Error())
-			_ = r.Status().Update(ctx, &cert)
-			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+			_ = controller.MarkCertDrift(ctx, r.Client, &cert, "DecryptFailed", err.Error())
+			return controller.RequeueAfterError(ctx, err, "awscert: decrypt private key",
+				"cert", req.String(), "arn", arn), nil
 		}
 	}
 
 	secret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      cert.Spec.SecretName,
-			Namespace: cert.Namespace,
+			Name:        cert.Spec.SecretName,
+			Namespace:   cert.Namespace,
+			Annotations: map[string]string{},
 		},
 		Type: corev1.SecretTypeTLS,
 		Data: map[string][]byte{
@@ -168,23 +182,52 @@ func (r *IssuerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 			corev1.TLSPrivateKeyKey: key,
 		},
 	}
-	if err := controllerutil.SetControllerReference(&cert, secret, r.Scheme); err != nil {
-		// Fall back to non-blocking owner ref — works for cluster-scoped issuers.
-		secret.OwnerReferences = []metav1.OwnerReference{{
-			APIVersion:         "cert-manager.io/v1",
-			Kind:               "Certificate",
-			Name:               cert.Name,
-			UID:                cert.UID,
-			Controller:         ptr(true),
-			BlockOwnerDeletion: ptr(true),
-		}}
-	}
-	if err := upsertSecret(ctx, r.Client, secret); err != nil {
-		return ctrl.Result{}, err
+	// ponytail: stamp cert-manager.io/issuer-{name,kind,group} on every
+	// Secret — without these cert-manager reports IncorrectIssuer on the
+	// synced Secret and refuses to trust it. Same trick the GCP controller
+	// uses.
+	secret.Annotations["cert-manager.io/issuer-name"] = cert.Spec.IssuerRef.Name
+	secret.Annotations["cert-manager.io/issuer-kind"] = cert.Spec.IssuerRef.Kind
+	secret.Annotations["cert-manager.io/issuer-group"] = cert.Spec.IssuerRef.Group
+	for k, v := range controller.CertAnnotations(chain) {
+		secret.Annotations[k] = v
 	}
 
-	controller.SetReady(&cert, true, "Synced", "certificate synced from ACM")
-	if err := r.Status().Update(ctx, &cert); err != nil {
+	// Fan-out: ClusterIssuer → every non-terminating ns (filtered). Issuer
+	// → cert.Namespace. Owner ref only on the cert.Namespace copy —
+	// cross-ns owner refs are silently dropped by k8s and the GC deletes
+	// the dependent right after Create.
+	filter := api.NamespaceFilter{}
+	if spec.NamespaceFilter != nil {
+		filter = *spec.NamespaceFilter
+	}
+	targets, err := controller.TargetNamespaces(ctx, r.Client, &cert, filter)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("list namespaces: %w", err)
+	}
+	for _, ns := range targets {
+		desired := secret.DeepCopy()
+		desired.Namespace = ns
+		if ns == cert.Namespace {
+			if err := controllerutil.SetControllerReference(&cert, desired, r.Scheme); err != nil {
+				// Fall back to non-blocking owner ref — works for cluster-scoped issuers.
+				desired.OwnerReferences = []metav1.OwnerReference{{
+					APIVersion:         "cert-manager.io/v1",
+					Kind:               "Certificate",
+					Name:               cert.Name,
+					UID:                cert.UID,
+					Controller:         ptr(true),
+					BlockOwnerDeletion: ptr(true),
+				}}
+			}
+		}
+		if err := controller.WriteSecret(ctx, r.Client, desired); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+
+	_ = controller.ClearCertDrift(ctx, r.Client, &cert, "Synced", "certificate synced from ACM")
+	if err := r.setReady(ctx, &cert, true, "Synced", "certificate synced from ACM"); err != nil {
 		return ctrl.Result{}, err
 	}
 	interval := spec.ResyncInterval.Duration
@@ -192,18 +235,4 @@ func (r *IssuerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		interval = 12 * time.Hour
 	}
 	return ctrl.Result{RequeueAfter: interval}, nil
-}
-
-func upsertSecret(ctx context.Context, c client.Client, desired *corev1.Secret) error {
-	existing := &corev1.Secret{}
-	err := c.Get(ctx, client.ObjectKeyFromObject(desired), existing)
-	if apierrors.IsNotFound(err) {
-		return c.Create(ctx, desired)
-	}
-	if err != nil {
-		return err
-	}
-	existing.Data = desired.Data
-	existing.Type = desired.Type
-	return c.Update(ctx, existing)
 }

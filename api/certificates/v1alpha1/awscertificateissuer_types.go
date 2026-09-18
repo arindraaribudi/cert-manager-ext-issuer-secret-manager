@@ -5,16 +5,20 @@ package v1alpha1
 import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	runtime "k8s.io/apimachinery/pkg/runtime"
+
+	api "github.com/arindraaribudi/cert-manager-ext-issuer-secret-manager/api/v1alpha1"
 )
 
 // AWSCertificateIssuerSpec describes how to fetch an issued cert from ACM.
 // ponytail: empty SecretRef → IRSA pod-identity chain; static path stays
-// available for non-EKS clusters.
+// available for non-EKS clusters. NamespaceFilter only applies to
+// ClusterIssuer kinds; namespaced Issuers ignore it (always one ns).
 type AWSCertificateIssuerSpec struct {
-	Region         string         `json:"region"`
-	SecretRef      *AWSSecretRef  `json:"secretRef,omitempty"`
-	Endpoint       string         `json:"endpoint,omitempty"`
-	ResyncInterval metav1.Duration `json:"resyncInterval,omitempty"` // +kubebuilder:default="12h"
+	Region          string                `json:"region"`
+	SecretRef       *AWSSecretRef         `json:"secretRef,omitempty"`
+	Endpoint        string                `json:"endpoint,omitempty"`
+	NamespaceFilter *api.NamespaceFilter  `json:"namespaceFilter,omitempty"`
+	ResyncInterval  metav1.Duration       `json:"resyncInterval,omitempty"` // +kubebuilder:default="12h"
 }
 
 // AWSSecretRef references a k8s Secret holding static AWS keys.

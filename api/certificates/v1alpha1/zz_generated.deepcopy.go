@@ -7,6 +7,7 @@
 package v1alpha1
 
 import (
+	apiv1alpha1 "github.com/arindraaribudi/cert-manager-ext-issuer-secret-manager/api/v1alpha1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 )
@@ -136,6 +137,11 @@ func (in *AWSCertificateIssuerSpec) DeepCopyInto(out *AWSCertificateIssuerSpec) 
 		in, out := &in.SecretRef, &out.SecretRef
 		*out = new(AWSSecretRef)
 		**out = **in
+	}
+	if in.NamespaceFilter != nil {
+		in, out := &in.NamespaceFilter, &out.NamespaceFilter
+		*out = new(apiv1alpha1.NamespaceFilter)
+		(*in).DeepCopyInto(*out)
 	}
 	out.ResyncInterval = in.ResyncInterval
 }
@@ -312,6 +318,11 @@ func (in *TencentCertificateIssuerSpec) DeepCopyInto(out *TencentCertificateIssu
 		in, out := &in.SecretRef, &out.SecretRef
 		*out = new(TencentSecretRef)
 		**out = **in
+	}
+	if in.NamespaceFilter != nil {
+		in, out := &in.NamespaceFilter, &out.NamespaceFilter
+		*out = new(apiv1alpha1.NamespaceFilter)
+		(*in).DeepCopyInto(*out)
 	}
 	out.ResyncInterval = in.ResyncInterval
 }

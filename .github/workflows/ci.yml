@@ -1,14 +1,18 @@
 name: ci
 
 on:
-  push:
-    tags:
-      - "v*"
-  workflow_run:
-    workflows: ["release"]
-    types: [completed]
-    branches:
-      - "*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build (e.g. v0.2.0 or v0.2.0-rc1)"
+        required: true
+        type: string
+  workflow_call:
+    inputs:
+      tag:
+        description: "Tag to build"
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -17,9 +21,6 @@ permissions:
 jobs:
   docker:
     name: build + push multi-arch image
-    if: |
-      github.event_name == 'push' ||
-      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -30,37 +31,23 @@ jobs:
         id: resolve
         run: |
           set -euo pipefail
-          if [ "${{ github.event_name }}" = "push" ]; then
-            tag="${GITHUB_REF_NAME%-}"
-            echo "tag=${tag}" >>"$GITHUB_OUTPUT"
-            echo "sha=${{ github.sha }}" >>"$GITHUB_OUTPUT"
-          else
-            sha="${{ github.event.workflow_run.head_sha }}"
-            echo "sha=${sha}" >>"$GITHUB_OUTPUT"
-            tag=$(git ls-remote --tags --sort=-v:refname "https://github.com/${GITHUB_REPOSITORY}.git" \
-              | grep -oE 'refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$' \
-              | head -n1 \
-              | sed 's|refs/tags/||')
-            if [ -n "${tag}" ]; then
-              echo "tag=${tag}" >>"$GITHUB_OUTPUT"
-            else
-              echo "tag=latest" >>"$GITHUB_OUTPUT"
-            fi
-          fi
+          tag="${{ inputs.tag }}"
+          echo "tag=${tag}" >>"$GITHUB_OUTPUT"
+          echo "sha=${{ github.sha }}" >>"$GITHUB_OUTPUT"
 
       - name: checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7.0.1
         with:
           ref: ${{ steps.resolve.outputs.sha }}
 
       - name: set up qemu
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@v4.4.0
 
       - name: set up docker buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4.4.1
 
       - name: log in to ghcr
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4.6.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -68,16 +55,16 @@ jobs:
 
       - name: extract metadata
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6.2.0
         with:
           images: ${{ env.IMAGE_NAME }}
           tags: |
             type=raw,value=${{ steps.resolve.outputs.tag }}
-            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=latest,enable=${{ !contains(inputs.tag, '-') }}
           flavor: latest=auto
 
       - name: build and push
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7.4.0
         with:
           context: .
           platforms: ${{ env.PLATFORMS }}

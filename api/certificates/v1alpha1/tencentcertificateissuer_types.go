@@ -5,17 +5,21 @@ package v1alpha1
 import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	runtime "k8s.io/apimachinery/pkg/runtime"
+
+	api "github.com/arindraaribudi/cert-manager-ext-issuer-secret-manager/api/v1alpha1"
 )
 
 // TencentCertificateIssuerSpec describes how to fetch an issued cert from
 // Tencent SSL. ponytail: SecretRef keys are secret-id + secret-key (matches
 // Tencent SDK convention; static fallback only — pod identity is the
-// TKE OIDC chain).
+// TKE OIDC chain). NamespaceFilter only applies to ClusterIssuer kinds;
+// namespaced Issuers ignore it (always one ns).
 type TencentCertificateIssuerSpec struct {
-	Region         string            `json:"region"`
-	SecretRef      *TencentSecretRef `json:"secretRef,omitempty"`
-	Endpoint       string            `json:"endpoint,omitempty"`
-	ResyncInterval metav1.Duration   `json:"resyncInterval,omitempty"` // +kubebuilder:default="12h"
+	Region          string                `json:"region"`
+	SecretRef       *TencentSecretRef     `json:"secretRef,omitempty"`
+	Endpoint        string                `json:"endpoint,omitempty"`
+	NamespaceFilter *api.NamespaceFilter  `json:"namespaceFilter,omitempty"`
+	ResyncInterval  metav1.Duration       `json:"resyncInterval,omitempty"` // +kubebuilder:default="12h"
 }
 
 // TencentSecretRef references a k8s Secret holding TENCENTCLOUD_SECRET_ID

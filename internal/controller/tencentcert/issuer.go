@@ -27,6 +27,7 @@ import (
 	tccommon "github.com/tencentcloud/tencentcloud-sdk-go-intl-en/tencentcloud/common"
 
 	certapi "github.com/arindraaribudi/cert-manager-ext-issuer-secret-manager/api/certificates/v1alpha1"
+	api "github.com/arindraaribudi/cert-manager-ext-issuer-secret-manager/api/v1alpha1"
 	ctrlpkg "github.com/arindraaribudi/cert-manager-ext-issuer-secret-manager/internal/controller"
 	"github.com/arindraaribudi/cert-manager-ext-issuer-secret-manager/internal/tencentcert"
 )
@@ -41,6 +42,18 @@ type IssuerReconciler struct {
 }
 
 func ptr[T any](v T) *T { return &v }
+
+// setReady updates the Ready condition via a merge patch on the status
+// subresource. Patches don't bump the main resourceVersion, so cert-manager's
+// trigger-loop Update on the same object won't see a stale rv and re-queue
+// with "object has been modified" — the optimistic-locking ping-pong we hit
+// before. ponytail: this is the standard cert-manager-aware fix for shared
+// controllers.
+func (r *IssuerReconciler) setReady(ctx context.Context, cert *cmapi.Certificate, status bool, reason, msg string) error {
+	original := cert.DeepCopy()
+	ctrlpkg.SetReady(cert, status, reason, msg)
+	return r.Status().Patch(ctx, cert, client.MergeFrom(original))
+}
 
 func hasCertIDAnnotation(obj client.Object) bool {
 	_, ok := obj.GetAnnotations()[AnnotationCertID]
@@ -108,26 +121,28 @@ func (r *IssuerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 
 	spec, ns, err := r.resolveIssuer(ctx, &cert)
 	if err != nil {
-		ctrlpkg.SetReady(&cert, false, "IssuerNotFound", err.Error())
-		_ = r.Status().Update(ctx, &cert)
-		return ctrl.Result{}, err
+		_ = ctrlpkg.MarkCertDrift(ctx, r.Client, &cert, "IssuerNotFound", err.Error())
+		return ctrlpkg.RequeueAfterError(ctx, err, "tencentcert: resolve issuer",
+			"cert", req.String(), "issuerRef", fmt.Sprintf("%s/%s/%s", cert.Spec.IssuerRef.Group, cert.Spec.IssuerRef.Kind, cert.Spec.IssuerRef.Name)), nil
 	}
 	creds, err := r.loadCredentials(ctx, spec, ns)
 	if err != nil {
-		ctrlpkg.SetReady(&cert, false, "MissingCredentials", err.Error())
-		_ = r.Status().Update(ctx, &cert)
-		return ctrl.Result{}, err
+		_ = ctrlpkg.MarkCertDrift(ctx, r.Client, &cert, "MissingCredentials", err.Error())
+		return ctrlpkg.RequeueAfterError(ctx, err, "tencentcert: load credentials",
+			"cert", req.String(), "secretRef", fmt.Sprintf("%s/%s", ns, spec.SecretRef.Name)), nil
 	}
 	cli, err := r.NewSSLClient(creds, spec.Region, spec.Endpoint)
 	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("tencentcert: new ssl client: %w", err)
+		_ = ctrlpkg.MarkCertDrift(ctx, r.Client, &cert, "ClientBuildFailed", err.Error())
+		return ctrlpkg.RequeueAfterError(ctx, fmt.Errorf("tencentcert: new ssl client: %w", err), "tencentcert: build SSL client",
+			"cert", req.String(), "region", spec.Region), nil
 	}
 
 	parts, err := cli.Download(ctx, certID)
 	if err != nil {
-		ctrlpkg.SetReady(&cert, false, "DownloadFailed", err.Error())
-		_ = r.Status().Update(ctx, &cert)
-		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+		_ = ctrlpkg.MarkCertDrift(ctx, r.Client, &cert, "DownloadFailed", err.Error())
+		return ctrlpkg.RequeueAfterError(ctx, err, "tencentcert: download certificate",
+			"cert", req.String(), "certID", certID, "region", spec.Region), nil
 	}
 	tlsCrt := tencentcert.AssembleTLS(parts.Leaf, parts.Chain)
 
@@ -135,6 +150,11 @@ func (r *IssuerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      cert.Spec.SecretName,
 			Namespace: cert.Namespace,
+			Annotations: map[string]string{
+				"cert-manager.io/issuer-name":  cert.Spec.IssuerRef.Name,
+				"cert-manager.io/issuer-kind":  cert.Spec.IssuerRef.Kind,
+				"cert-manager.io/issuer-group": cert.Spec.IssuerRef.Group,
+			},
 		},
 		Type: corev1.SecretTypeTLS,
 		Data: map[string][]byte{
@@ -142,23 +162,49 @@ func (r *IssuerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 			corev1.TLSPrivateKeyKey: parts.PrivateKey,
 		},
 	}
-	if err := controllerutil.SetControllerReference(&cert, secret, r.Scheme); err != nil {
-		// Fall back to non-blocking owner ref — works for cluster-scoped issuers.
-		secret.OwnerReferences = []metav1.OwnerReference{{
-			APIVersion:         "cert-manager.io/v1",
-			Kind:               "Certificate",
-			Name:               cert.Name,
-			UID:                cert.UID,
-			Controller:         ptr(true),
-			BlockOwnerDeletion: ptr(true),
-		}}
+	// ponytail: stamp leaf-cert info annotations (common-name, alt-names,
+	// not-before, not-after) so the Secret matches what cert-manager itself
+	// would write on Secrets it owns. nil on parse failure — informational.
+	for k, v := range ctrlpkg.CertAnnotations(parts.Leaf) {
+		secret.Annotations[k] = v
 	}
-	if err := upsertSecret(ctx, r.Client, secret); err != nil {
-		return ctrl.Result{}, err
+
+	// Fan-out: ClusterIssuer → every non-terminating ns (filtered). Issuer
+	// → cert.Namespace. Owner ref only on the cert.Namespace copy —
+	// cross-ns owner refs are silently dropped by k8s.
+	filter := api.NamespaceFilter{}
+	if spec.NamespaceFilter != nil {
+		filter = *spec.NamespaceFilter
 	}
-	ctrlpkg.SetReady(&cert, true, "Synced", "certificate synced from Tencent SSL")
-	if err := r.Status().Update(ctx, &cert); err != nil {
-		return ctrl.Result{}, err
+	targets, err := ctrlpkg.TargetNamespaces(ctx, r.Client, &cert, filter)
+	if err != nil {
+		return ctrlpkg.RequeueAfterError(ctx, fmt.Errorf("list namespaces: %w", err), "tencentcert: list target namespaces"), nil
+	}
+	for _, ns := range targets {
+		desired := secret.DeepCopy()
+		desired.Namespace = ns
+		if ns == cert.Namespace {
+			if err := controllerutil.SetControllerReference(&cert, desired, r.Scheme); err != nil {
+				desired.OwnerReferences = []metav1.OwnerReference{{
+					APIVersion:         "cert-manager.io/v1",
+					Kind:               "Certificate",
+					Name:               cert.Name,
+					UID:                cert.UID,
+					Controller:         ptr(true),
+					BlockOwnerDeletion: ptr(true),
+				}}
+			}
+		}
+		if err := ctrlpkg.WriteSecret(ctx, r.Client, desired); err != nil {
+			return ctrlpkg.RequeueAfterError(ctx, err, "tencentcert: write secret", "namespace", ns), nil
+		}
+	}
+	if err := deleteStaleRequests(ctx, r.Client, req.Namespace, cert.Name); err != nil {
+		return ctrlpkg.RequeueAfterError(ctx, err, "tencentcert: delete stale CertificateRequests"), nil
+	}
+	_ = ctrlpkg.ClearCertDrift(ctx, r.Client, &cert, "Synced", "certificate synced from Tencent SSL")
+	if err := r.setReady(ctx, &cert, true, "Synced", "certificate synced from Tencent SSL"); err != nil {
+		return ctrlpkg.RequeueAfterError(ctx, err, "tencentcert: setReady true"), nil
 	}
 	interval := spec.ResyncInterval.Duration
 	if interval <= 0 {
@@ -167,18 +213,22 @@ func (r *IssuerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	return ctrl.Result{RequeueAfter: interval}, nil
 }
 
-func upsertSecret(ctx context.Context, c client.Client, desired *corev1.Secret) error {
-	existing := &corev1.Secret{}
-	err := c.Get(ctx, client.ObjectKeyFromObject(desired), existing)
-	if apierrors.IsNotFound(err) {
-		return c.Create(ctx, desired)
+// deleteStaleRequests removes CertificateRequests left behind by cert-manager
+// when this controller bypasses the standard CR-signing flow. Without this,
+// cert-manager keeps re-issuing the CR on each reconcile and fights our
+// Ready=True.
+func deleteStaleRequests(ctx context.Context, c client.Client, namespace, certName string) error {
+	var crs cmapi.CertificateRequestList
+	if err := c.List(ctx, &crs, client.InNamespace(namespace),
+		client.MatchingLabels{"cert-manager.io/certificate-name": certName}); err != nil {
+		return fmt.Errorf("list stale CertificateRequests: %w", err)
 	}
-	if err != nil {
-		return err
+	for i := range crs.Items {
+		if err := c.Delete(ctx, &crs.Items[i]); err != nil && !apierrors.IsNotFound(err) {
+			return fmt.Errorf("delete CertificateRequest %s: %w", crs.Items[i].Name, err)
+		}
 	}
-	existing.Data = desired.Data
-	existing.Type = desired.Type
-	return c.Update(ctx, existing)
+	return nil
 }
 
 var _ = cmmeta.ConditionTrue
