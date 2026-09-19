@@ -12,6 +12,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/service/acm"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -25,6 +26,7 @@ import (
 	api "github.com/arindraaribudi/cert-manager-ext-issuer-secret-manager/api/v1alpha1"
 	"github.com/arindraaribudi/cert-manager-ext-issuer-secret-manager/internal/awscert"
 	controller "github.com/arindraaribudi/cert-manager-ext-issuer-secret-manager/internal/controller"
+	"github.com/arindraaribudi/cert-manager-ext-issuer-secret-manager/internal/keystore"
 )
 
 // AnnotationARN is the cert-id annotation on Certificate CRs.
@@ -201,6 +203,36 @@ func (r *IssuerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	if spec.NamespaceFilter != nil {
 		filter = *spec.NamespaceFilter
 	}
+
+	// Build keystore auxiliary keys. Read existing cert-ns Secret for
+	// password stability across reconciles. awscert has no separate
+	// chain variable: chain (from SplitPEM) is leaf+chain in one PEM
+	// bundle, so pass it as certPEM and nil as chainPEM — the keystore
+	// builder only reads the first block as the leaf.
+	keystoreExisting := &corev1.Secret{}
+	keystoreExistingNS := cert.Namespace
+	keystoreGetErr := r.Get(ctx, types.NamespacedName{Name: cert.Spec.SecretName, Namespace: keystoreExistingNS}, keystoreExisting)
+	if apierrors.IsNotFound(keystoreGetErr) {
+		keystoreExisting = nil
+	} else if keystoreGetErr != nil {
+		_ = controller.MarkCertDrift(ctx, r.Client, &cert, "SecretReadFailed", keystoreGetErr.Error())
+		return controller.RequeueAfterError(ctx, keystoreGetErr, "awscert: read existing secret for keystore build",
+			"cert", req.String()), nil
+	}
+
+	leafPEM, chainOnly := keystore.SplitLeafAndChain(chain)
+	jks, p12, pw, skipped, err := keystore.Build(leafPEM, key, chainOnly, keystoreExisting)
+	if err != nil {
+		_ = controller.MarkCertDrift(ctx, r.Client, &cert, "KeystoreBuildFailed", err.Error())
+		// fall through — TLS half still ships; keystore drift visible on next reconcile.
+	} else if skipped {
+		_ = controller.MarkCertDrift(ctx, r.Client, &cert, "KeystoreSkipped", "ACM export lacks private key; JKS/PKCS12 not generated")
+	} else {
+		secret.Data["keystore.jks"] = jks
+		secret.Data["keystore.p12"] = p12
+		secret.Data["keystore.password"] = pw
+	}
+
 	targets, err := controller.TargetNamespaces(ctx, r.Client, &cert, filter)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("list namespaces: %w", err)

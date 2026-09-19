@@ -10,6 +10,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/acm v1.50.0
 	github.com/aws/aws-sdk-go-v2/service/secretsmanager v1.48.0
 	github.com/cert-manager/cert-manager v1.15.4
+	github.com/pavlo-v-chernykh/keystore-go/v4 v4.5.0
 	github.com/tencentcloud/tencentcloud-sdk-go-intl-en v3.0.1490+incompatible
 	github.com/youmark/pkcs8 v0.0.0-20240726163527-a2c0da244d78
 	google.golang.org/api v0.297.0
@@ -17,6 +18,7 @@ require (
 	k8s.io/apimachinery v0.30.3
 	k8s.io/client-go v0.30.1
 	sigs.k8s.io/controller-runtime v0.18.4
+	software.sslmate.com/src/go-pkcs12 v0.4.0
 )
 
 require (
