@@ -26,6 +26,7 @@ import (
 	cmapi "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
 
 	api "github.com/arindraaribudi/cert-manager-ext-issuer-secret-manager/api/v1alpha1"
+	"github.com/arindraaribudi/cert-manager-ext-issuer-secret-manager/internal/keystore"
 )
 
 // RequeueAfterError lives in log.go (shared across reconcilers).
@@ -132,6 +133,36 @@ func (r *IssuerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	}
 	for k, v := range CertAnnotations(parsed.Certificate) {
 		secretTemplate.Annotations[k] = v
+	}
+
+	// 4-pre. Build keystores (JKS + PKCS12) from cert + key + chain.
+	// Same Secret; auxiliary keys alongside the existing TLS Data.
+	// Existing Secret (cert namespace only) is consulted for password
+	// stability across reconciles.
+	keystoreExisting := &corev1.Secret{}
+	keystoreExistingNS := cert.Namespace
+	keystoreGetErr := r.Get(ctx, types.NamespacedName{Name: cert.Spec.SecretName, Namespace: keystoreExistingNS}, keystoreExisting)
+	if apierrors.IsNotFound(keystoreGetErr) {
+		keystoreExisting = nil
+	} else if keystoreGetErr != nil {
+		_ = MarkCertDrift(ctx, r.Client, &cert, "SecretReadFailed", keystoreGetErr.Error())
+		return RequeueAfterError(ctx, keystoreGetErr, "secret-manager: read existing secret for keystore build",
+			"cert", req.String()), nil
+	}
+
+	jks, p12, pw, skipped, err := keystore.Build(parsed.Certificate, parsed.PrivateKey, parsed.Chain, keystoreExisting)
+	if err != nil {
+		// ponytail: keystore build failure is soft drift — TLS Secret still
+		// ships because cert-manager has already observed TLS Data on prior
+		// reconciles and deleting it would break consumers. Next reconcile
+		// retries the keystore step.
+		_ = MarkCertDrift(ctx, r.Client, &cert, "KeystoreBuildFailed", err.Error())
+	} else if skipped {
+		_ = MarkCertDrift(ctx, r.Client, &cert, "KeystoreSkipped", "source payload lacks a private key; JKS/PKCS12 not generated")
+	} else {
+		secretTemplate.Data["keystore.jks"] = jks
+		secretTemplate.Data["keystore.p12"] = p12
+		secretTemplate.Data["keystore.password"] = pw
 	}
 
 	// 4a. Resolve target namespaces.
