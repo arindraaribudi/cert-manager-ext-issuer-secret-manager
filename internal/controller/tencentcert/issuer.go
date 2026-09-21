@@ -29,6 +29,7 @@ import (
 	certapi "github.com/arindraaribudi/cert-manager-ext-issuer-secret-manager/api/certificates/v1alpha1"
 	api "github.com/arindraaribudi/cert-manager-ext-issuer-secret-manager/api/v1alpha1"
 	ctrlpkg "github.com/arindraaribudi/cert-manager-ext-issuer-secret-manager/internal/controller"
+	"github.com/arindraaribudi/cert-manager-ext-issuer-secret-manager/internal/keystore"
 	"github.com/arindraaribudi/cert-manager-ext-issuer-secret-manager/internal/tencentcert"
 )
 
@@ -176,6 +177,34 @@ func (r *IssuerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	if spec.NamespaceFilter != nil {
 		filter = *spec.NamespaceFilter
 	}
+
+	// Build keystore auxiliary keys. Read existing cert-ns Secret for
+	// password stability across reconciles. tencentcert separates leaf
+	// and chain, so pass both — builder reads first PEM block as leaf
+	// and appends chain to JKS/PKCS12 trust chain.
+	keystoreExisting := &corev1.Secret{}
+	keystoreExistingNS := cert.Namespace
+	keystoreGetErr := r.Get(ctx, types.NamespacedName{Name: cert.Spec.SecretName, Namespace: keystoreExistingNS}, keystoreExisting)
+	if apierrors.IsNotFound(keystoreGetErr) {
+		keystoreExisting = nil
+	} else if keystoreGetErr != nil {
+		_ = ctrlpkg.MarkCertDrift(ctx, r.Client, &cert, "SecretReadFailed", keystoreGetErr.Error())
+		return ctrlpkg.RequeueAfterError(ctx, keystoreGetErr, "tencentcert: read existing secret for keystore build",
+			"cert", req.String()), nil
+	}
+
+	jks, p12, pw, skipped, err := keystore.Build(parts.Leaf, parts.PrivateKey, parts.Chain, keystoreExisting)
+	if err != nil {
+		_ = ctrlpkg.MarkCertDrift(ctx, r.Client, &cert, "KeystoreBuildFailed", err.Error())
+		// fall through — TLS half still ships; keystore drift visible on next reconcile.
+	} else if skipped {
+		_ = ctrlpkg.MarkCertDrift(ctx, r.Client, &cert, "KeystoreSkipped", "Tencent SSL lacks private key; JKS/PKCS12 not generated")
+	} else {
+		secret.Data["keystore.jks"] = jks
+		secret.Data["keystore.p12"] = p12
+		secret.Data["keystore.password"] = pw
+	}
+
 	targets, err := ctrlpkg.TargetNamespaces(ctx, r.Client, &cert, filter)
 	if err != nil {
 		return ctrlpkg.RequeueAfterError(ctx, fmt.Errorf("list namespaces: %w", err), "tencentcert: list target namespaces"), nil

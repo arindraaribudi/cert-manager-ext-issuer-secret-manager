@@ -2,8 +2,17 @@ package controller
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"errors"
+	"math/big"
+	"strings"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -14,6 +23,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	api "github.com/arindraaribudi/cert-manager-ext-issuer-secret-manager/api/v1alpha1"
+	"github.com/arindraaribudi/cert-manager-ext-issuer-secret-manager/internal/keystore"
 	cmapi "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
 	cmmeta "github.com/cert-manager/cert-manager/pkg/apis/meta/v1"
 )
@@ -152,8 +162,10 @@ func TestReconcile_HappyPath(t *testing.T) {
 	keyPemEscaped := `-----BEGIN PRIVATE KEY-----\nMIIE\n-----END PRIVATE KEY-----`
 	payload := []byte(`{"certificate":"` + certPemEscaped + `","private_key":"` + keyPemEscaped + `"}`)
 
-	certPem := []byte("-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----")
-	keyPem := []byte("-----BEGIN PRIVATE KEY-----\nMIIE\n-----END PRIVATE KEY-----")
+	// normalizePEM always emits canonical PEM (trailing newline). Compare
+	// against the canonical form, not the literal payload string.
+	certPem := []byte("-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n")
+	keyPem := []byte("-----BEGIN PRIVATE KEY-----\nMIIE\n-----END PRIVATE KEY-----\n")
 
 	cert := &cmapi.Certificate{
 		ObjectMeta: metav1.ObjectMeta{
@@ -356,4 +368,86 @@ func TestReconcile_ClusterIssuerFanOut_NamespaceFilter(t *testing.T) {
 			t.Fatalf("secret unexpectedly written to %s (not in allow-list)", ns)
 		}
 	}
+}
+
+func TestReconcile_GeneratesKeystores(t *testing.T) {
+	certPEM, keyPEM := mustGenerateTestCertForController(t)
+
+	certPemEscaped := strings.ReplaceAll(string(certPEM), "\n", "\\n")
+	keyPemEscaped := strings.ReplaceAll(string(keyPEM), "\n", "\\n")
+	payload := []byte(`{"certificate":"` + certPemEscaped + `","private_key":"` + keyPemEscaped + `"}`)
+
+	cert := &cmapi.Certificate{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "c1",
+			Namespace: "ns1",
+			Annotations: map[string]string{
+				AnnotationSecretName: "cloud/secret",
+			},
+		},
+		Spec: cmapi.CertificateSpec{
+			IssuerRef:  cmmeta.ObjectReference{Name: "aws-iss", Kind: "AWSIssuer"},
+			SecretName: "tls-out",
+		},
+	}
+	r := newTestReconciler(t, cert)
+	r.ProviderResolvers = map[string]SecretResolver{
+		"AWSIssuer": func(ctx context.Context, ref string) ([]byte, error) {
+			return payload, nil
+		},
+	}
+	r.IssuerConfigFromIssuer = func(ctx context.Context, c *cmapi.Certificate) (api.IssuerConfig, error) {
+		return api.IssuerConfig{}, nil
+	}
+
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "c1", Namespace: "ns1"}}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	var sec corev1.Secret
+	if err := r.Get(context.Background(), types.NamespacedName{Name: "tls-out", Namespace: "ns1"}, &sec); err != nil {
+		t.Fatal(err)
+	}
+	if len(sec.Data["keystore.jks"]) == 0 {
+		t.Error("keystore.jks missing or empty")
+	}
+	if len(sec.Data["keystore.p12"]) == 0 {
+		t.Error("keystore.p12 missing or empty")
+	}
+	if len(sec.Data["keystore.password"]) == 0 {
+		t.Error("keystore.password missing or empty")
+	}
+	if err := keystore.ParseJKSForTest(sec.Data["keystore.jks"], sec.Data["keystore.password"]); err != nil {
+		t.Errorf("JKS load failed: %v", err)
+	}
+}
+
+func mustGenerateTestCertForController(t *testing.T) (certPEM, keyPEM []byte) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "controller-test.example.com"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		DNSNames:              []string{"controller-test.example.com"},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certPEM = pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	keyDER, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyPEM = pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})
+	return
 }

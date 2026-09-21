@@ -35,7 +35,7 @@ permissions:
 jobs:
   govulncheck:
     name: govulncheck
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       contents: read
@@ -67,7 +67,7 @@ jobs:
 
   lint:
     name: golangci-lint
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       contents: read
@@ -103,7 +103,7 @@ jobs:
 
   test:
     name: go test
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
       contents: read
@@ -128,7 +128,7 @@ jobs:
 
   build:
     name: go build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       contents: read
@@ -153,7 +153,7 @@ jobs:
 
   release:
     name: release
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [govulncheck, lint, test, build]
     timeout-minutes: 30
     outputs:
