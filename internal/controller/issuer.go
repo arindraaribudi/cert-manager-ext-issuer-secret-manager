@@ -6,7 +6,6 @@
 package controller
 
 import (
-	"bytes"
 	"context"
 	"crypto/x509"
 	"encoding/pem"
@@ -106,8 +105,19 @@ func (r *IssuerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		return RequeueAfterError(ctx, err, "secret-manager: parse payload",
 			"cert", req.String(), "secretRef", ref, "kind", kind), nil
 	}
+	if err := VerifyChain(parsed.Certificate, parsed.Chain); err != nil {
+		_ = MarkCertDrift(ctx, r.Client, &cert, "ChainInvalid", err.Error())
+		return RequeueAfterError(ctx, err, "secret-manager: verify chain",
+			"cert", req.String(), "secretRef", ref, "kind", kind), nil
+	}
 
 	// 4. Build k8s Secret
+	// Complete the chain (append a known root when the source didn't ship
+	// one) before splitting it back out — same treatment CertSyncer gives
+	// tls.crt, so this reconciler's ca.crt/keystore don't silently diverge.
+	completedChain := CompleteChain(append(append([]byte{}, parsed.Certificate...), parsed.Chain...))
+	_, chainForSecret := keystore.SplitLeafAndChain(completedChain)
+
 	secretTemplate := corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: cert.Spec.SecretName,
@@ -120,6 +130,9 @@ func (r *IssuerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 				"cert-manager.io/issuer-name":  cert.Spec.IssuerRef.Name,
 				"cert-manager.io/issuer-kind":  cert.Spec.IssuerRef.Kind,
 				"cert-manager.io/issuer-group": issuerGroup(cert.Spec.IssuerRef.Group),
+				AnnotationSourceHash:           SourceHash(parsed.Certificate, parsed.PrivateKey, parsed.Chain),
+				AnnotationSecretName:           ref,
+				AnnotationLastSyncTime:         time.Now().UTC().Format(time.RFC3339),
 			},
 		},
 		Type: corev1.SecretTypeTLS,
@@ -128,9 +141,10 @@ func (r *IssuerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 			corev1.TLSPrivateKeyKey: parsed.PrivateKey,
 		},
 	}
-	if len(parsed.Chain) > 0 {
-		secretTemplate.Data[corev1.ServiceAccountRootCAKey] = parsed.Chain
+	if len(chainForSecret) > 0 {
+		secretTemplate.Data[corev1.ServiceAccountRootCAKey] = chainForSecret
 	}
+	secretTemplate.Annotations[AnnotationChain] = ChainComposition(completedChain)
 	for k, v := range CertAnnotations(parsed.Certificate) {
 		secretTemplate.Annotations[k] = v
 	}
@@ -150,7 +164,8 @@ func (r *IssuerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 			"cert", req.String()), nil
 	}
 
-	jks, p12, pw, skipped, err := keystore.Build(parsed.Certificate, parsed.PrivateKey, parsed.Chain, keystoreExisting)
+	jks, p12, pw, skipped, err := BuildKeystore(parsed.Certificate, parsed.PrivateKey, chainForSecret,
+		keystoreExisting, secretTemplate.Annotations[AnnotationSourceHash])
 	if err != nil {
 		// ponytail: keystore build failure is soft drift — TLS Secret still
 		// ships because cert-manager has already observed TLS Data on prior
@@ -165,6 +180,12 @@ func (r *IssuerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		secretTemplate.Data["keystore.password"] = pw
 	}
 
+	if err := VerifySecretData(secretTemplate.Data); err != nil {
+		_ = MarkCertDrift(ctx, r.Client, &cert, "SecretVerifyFailed", err.Error())
+		return RequeueAfterError(ctx, err, "secret-manager: verify secret data",
+			"cert", req.String(), "secretRef", ref, "kind", kind), nil
+	}
+
 	// 4a. Resolve target namespaces.
 	// Namespaced Issuer → just the Certificate's ns.
 	// ClusterIssuer-kind → every non-terminating namespace in the cluster.
@@ -175,6 +196,11 @@ func (r *IssuerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 			"cert", req.String()), nil
 	}
 
+	// Attempt every target namespace even if an earlier one fails — a
+	// transient error writing to one namespace must not leave the rest of
+	// the fan-out stale with pre-drift cert data until the next reconcile.
+	var writeErr error
+	var failedNS string
 	for _, ns := range targets {
 		secret := secretTemplate.DeepCopy()
 		secret.Namespace = ns
@@ -189,11 +215,14 @@ func (r *IssuerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 				}),
 			}
 		}
-		if err := r.writeSecret(ctx, secret); err != nil {
-			_ = MarkCertDrift(ctx, r.Client, &cert, "SecretWriteFailed", err.Error())
-			return RequeueAfterError(ctx, err, "secret-manager: write secret",
-				"cert", req.String(), "namespace", ns, "secretName", cert.Spec.SecretName), nil
+		if err := r.writeSecret(ctx, secret); err != nil && writeErr == nil {
+			writeErr, failedNS = err, ns
 		}
+	}
+	if writeErr != nil {
+		_ = MarkCertDrift(ctx, r.Client, &cert, "SecretWriteFailed", writeErr.Error())
+		return RequeueAfterError(ctx, writeErr, "secret-manager: write secret",
+			"cert", req.String(), "namespace", failedNS, "secretName", cert.Spec.SecretName), nil
 	}
 
 	// 4b. Sign the matching CertificateRequest so cert-manager's issuing
@@ -368,6 +397,11 @@ func (r *IssuerReconciler) writeSecret(ctx context.Context, secret *corev1.Secre
 // payload bytes before the Patch makes the reconcile a true no-op when the
 // cloud cert hasn't rotated.
 func WriteSecret(ctx context.Context, c client.Client, secret *corev1.Secret) error {
+	if secret.Annotations == nil {
+		secret.Annotations = map[string]string{}
+	}
+	secret.Annotations[AnnotationSecretHash] = HashSecretData(secret.Data)
+
 	existing := &corev1.Secret{}
 	err := c.Get(ctx, client.ObjectKeyFromObject(secret), existing)
 	if apierrors.IsNotFound(err) {
@@ -376,7 +410,7 @@ func WriteSecret(ctx context.Context, c client.Client, secret *corev1.Secret) er
 	if err != nil {
 		return fmt.Errorf("get secret %s/%s: %w", secret.Namespace, secret.Name, err)
 	}
-	if secretPayloadEqual(existing, secret) {
+	if secretUpToDate(existing, secret) {
 		return nil
 	}
 	// Apply desired state onto the existing object (preserves rv + uid +
@@ -486,25 +520,27 @@ func clearSecretDrift(ctx context.Context, c client.Client, cert *cmapi.Certific
 	return c.Patch(ctx, secret, client.MergeFrom(original))
 }
 
-func secretPayloadEqual(a, b *corev1.Secret) bool {
-	if a.Type != b.Type {
+// secretUpToDate reports whether the live Secret already carries exactly what
+// we want to write. Three gates, cheapest first: the desired payload digest,
+// the desired source digest, and a tamper check that recomputes the live
+// Data digest — an out-of-band edit leaves the stored annotation stale, which
+// forces a rewrite. Secrets written before the hash annotations existed fail
+// the tamper check once and are restamped.
+func secretUpToDate(existing, desired *corev1.Secret) bool {
+	if existing.Type != desired.Type {
 		return false
 	}
-	if !bytes.Equal(a.Data[corev1.TLSCertKey], b.Data[corev1.TLSCertKey]) {
+	if existing.Annotations[AnnotationSecretHash] != desired.Annotations[AnnotationSecretHash] {
 		return false
 	}
-	if !bytes.Equal(a.Data[corev1.TLSPrivateKeyKey], b.Data[corev1.TLSPrivateKeyKey]) {
+	if existing.Annotations[AnnotationSourceHash] != desired.Annotations[AnnotationSourceHash] {
 		return false
 	}
-	if ca, ok := a.Data[corev1.ServiceAccountRootCAKey]; ok {
-		if !bytes.Equal(ca, b.Data[corev1.ServiceAccountRootCAKey]) {
-			return false
-		}
-	} else if _, ok := b.Data[corev1.ServiceAccountRootCAKey]; ok {
+	if HashSecretData(existing.Data) != existing.Annotations[AnnotationSecretHash] {
 		return false
 	}
-	for k, v := range b.Annotations {
-		if a.Annotations[k] != v {
+	for k, v := range desired.Annotations {
+		if existing.Annotations[k] != v {
 			return false
 		}
 	}

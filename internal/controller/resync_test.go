@@ -2,7 +2,9 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -10,6 +12,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -118,6 +121,42 @@ func TestResyncer_StartDisabled(t *testing.T) {
 	defer cancel()
 	if err := r.Start(ctx); err != nil {
 		t.Fatalf("Start: %v", err)
+	}
+}
+
+// TestResyncer_Drift_ReconcilesAllCertsConcurrently verifies drift() fans out
+// reconciles through the bounded errgroup pool and every matching cert gets
+// reconciled exactly once. Run with -race to prove the pool has no data races.
+func TestResyncer_Drift_ReconcilesAllCertsConcurrently(t *testing.T) {
+	s := runtime.NewScheme()
+	if err := clientgoscheme.AddToScheme(s); err != nil {
+		t.Fatal(err)
+	}
+	if err := cmapi.AddToScheme(s); err != nil {
+		t.Fatal(err)
+	}
+	var objs []client.Object
+	const n = 25
+	for i := 0; i < n; i++ {
+		objs = append(objs, &cmapi.Certificate{
+			ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("c%d", i), Namespace: "default"},
+			Spec:       cmapi.CertificateSpec{IssuerRef: cmmeta.ObjectReference{Group: IssuerGroup}},
+		})
+	}
+	kube := fake.NewClientBuilder().WithScheme(s).WithObjects(objs...).Build()
+
+	var reconciled int64
+	r := &Resyncer{
+		Client:   kube,
+		Interval: 10 * time.Millisecond,
+		Reconcile: func(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+			atomic.AddInt64(&reconciled, 1)
+			return ctrl.Result{}, nil
+		},
+	}
+	r.drift(context.Background())
+	if got := atomic.LoadInt64(&reconciled); got != n {
+		t.Fatalf("reconciled %d certs, want %d", got, n)
 	}
 }
 

@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"time"
 
+	"golang.org/x/sync/errgroup"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -68,11 +69,12 @@ func (r *Resyncer) Start(ctx context.Context) error {
 	}
 }
 
-// drift lists Certificates for our group and re-reconciles each. Errors per
-// cert are logged and skipped — one bad cert must not abort the loop.
-// ponytail: direct Reconcile call (not queue) is intentional. Adds latency
-// to the tick (sequential per-cert work) but is simple, deterministic, and
-// won't race with the watch-driven reconcile for the same object.
+// drift lists Certificates for our group and re-reconciles each, bounded to
+// 8 concurrent reconciles via errgroup. Errors per cert are logged and
+// skipped — one bad cert must not abort the loop.
+// ponytail: direct Reconcile call (not queue) is intentional. Bounding to 8
+// keeps one slow cloud call from serializing the whole pass, without
+// hammering the cloud API or apiserver during a large drift sweep.
 func (r *Resyncer) drift(ctx context.Context) {
 	l := log.FromContext(ctx)
 	var certs cmapi.CertificateList
@@ -80,16 +82,22 @@ func (r *Resyncer) drift(ctx context.Context) {
 		l.Error(err, "resync: list certificates")
 		return
 	}
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(8)
 	for i := range certs.Items {
 		c := &certs.Items[i]
 		if c.Spec.IssuerRef.Group != IssuerGroup {
 			continue
 		}
-		req := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(c)}
-		if _, err := r.Reconcile(ctx, req); err != nil {
-			l.Error(err, "resync: reconcile", "certificate", client.ObjectKeyFromObject(c))
-		}
+		g.Go(func() error {
+			req := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(c)}
+			if _, err := r.Reconcile(gctx, req); err != nil {
+				l.Error(err, "resync: reconcile", "certificate", client.ObjectKeyFromObject(c))
+			}
+			return nil // per-cert errors are logged, not propagated — same as before
+		})
 	}
+	_ = g.Wait()
 }
 
 // Compile-time assertion that Resyncer satisfies manager.Runnable.

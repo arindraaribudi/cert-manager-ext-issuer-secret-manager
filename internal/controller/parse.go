@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/json"
 	"encoding/pem"
@@ -35,9 +36,9 @@ func Extract(payload []byte, keys api.PayloadKeys) (*extracted, error) {
 	if !ok || len(keyRaw) == 0 || string(keyRaw) == `""` {
 		return nil, fmt.Errorf("missing field %q", keyKey)
 	}
-	out := &extracted{Certificate: normalizePEM(mustUnquote(certRaw)), PrivateKey: normalizePEM(mustUnquote(keyRaw))}
+	out := &extracted{Certificate: NormalizePEM(mustUnquote(certRaw)), PrivateKey: NormalizePEM(mustUnquote(keyRaw))}
 	if chainRaw, ok := raw[chainKey]; ok && len(chainRaw) > 0 && string(chainRaw) != `""` {
-		out.Chain = normalizePEM(mustUnquote(chainRaw))
+		out.Chain = NormalizePEM(mustUnquote(chainRaw))
 	}
 	return out, nil
 }
@@ -50,7 +51,7 @@ func mustUnquote(raw json.RawMessage) []byte {
 	return []byte(s)
 }
 
-// normalizePEM decodes every PEM block in raw, drops duplicates by DER
+// NormalizePEM decodes every PEM block in raw, drops duplicates by DER
 // SHA-256, and re-emits the surviving blocks with a single trailing
 // newline. Trailing non-PEM bytes are discarded.
 //
@@ -60,10 +61,15 @@ func mustUnquote(raw json.RawMessage) []byte {
 // resulting Secret (cert-manager, nginx-ingress, JKS readers) sees a
 // malformed tls.crt/tls.key. Fixing it at the Extract boundary keeps
 // the providers blissfully unaware.
-func normalizePEM(raw []byte) []byte {
+func NormalizePEM(raw []byte) []byte {
 	if len(raw) == 0 {
 		return raw
 	}
+	// pem.Decode bails out (returns a nil block) the instant END and BEGIN
+	// share one line with no newline between them, so a single mashed
+	// boundary aborts the whole scan and the fallback below would ship the
+	// mash straight into the Secret untouched. Split the glue before decoding.
+	raw = bytes.ReplaceAll(raw, []byte("----------BEGIN"), []byte("-----\n-----BEGIN"))
 	seen := make(map[[32]byte]bool, 4)
 	var out []byte
 	rest := raw
