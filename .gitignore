@@ -10,3 +10,6 @@ info
 install.yaml
 deploy
 archive
+.agents
+agent
+skills-*

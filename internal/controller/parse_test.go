@@ -60,6 +60,17 @@ func TestExtract(t *testing.T) {
 			want: &extracted{Certificate: cert, PrivateKey: key, Chain: nil},
 		},
 		{
+			name: "certificates truly mashed with no newline at all",
+			// The wire symptom: "-----END CERTIFICATE----------BEGIN
+			// CERTIFICATE-----" on one line, zero bytes between them.
+			// pem.Decode aborts entirely on this (returns a nil block on
+			// the first pass), so NormalizePEM must split the glue before
+			// decoding or the mash ships into the Secret untouched.
+			json: `{"certificate":"` + jsonEscape(strings.Repeat(strings.TrimSuffix(string(cert), "\n"), 3)+"\n") + `","private_key":"` + jsonEscape(string(key)) + `"}`,
+			keys: v1alpha1.PayloadKeys{},
+			want: &extracted{Certificate: cert, PrivateKey: key, Chain: nil},
+		},
+		{
 			name:    "missing certificate",
 			json:    `{"private_key":"` + jsonEscape(string(key)) + `"}`,
 			keys:    v1alpha1.PayloadKeys{},

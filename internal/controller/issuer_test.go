@@ -21,6 +21,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	api "github.com/arindraaribudi/cert-manager-ext-issuer-secret-manager/api/v1alpha1"
 	"github.com/arindraaribudi/cert-manager-ext-issuer-secret-manager/internal/keystore"
@@ -154,18 +155,12 @@ func TestReconcile_SourceMissing(t *testing.T) {
 }
 
 func TestReconcile_HappyPath(t *testing.T) {
-	// Use literal \n in the JSON string (escaped newlines), not raw newlines —
-	// raw newlines inside a JSON string value are invalid syntax and fail
-	// Extract with "invalid JSON". mustUnquote unescapes \n back to a real
-	// newline on read, so compare against the unescaped form below.
-	certPemEscaped := `-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----`
-	keyPemEscaped := `-----BEGIN PRIVATE KEY-----\nMIIE\n-----END PRIVATE KEY-----`
+	// Post-write verify (VerifySecretData) x509-parses tls.crt, so the
+	// fixture must be a real certificate, not placeholder PEM bytes.
+	certPem, keyPem := mustGenerateTestCertForController(t)
+	certPemEscaped := strings.ReplaceAll(string(certPem), "\n", "\\n")
+	keyPemEscaped := strings.ReplaceAll(string(keyPem), "\n", "\\n")
 	payload := []byte(`{"certificate":"` + certPemEscaped + `","private_key":"` + keyPemEscaped + `"}`)
-
-	// normalizePEM always emits canonical PEM (trailing newline). Compare
-	// against the canonical form, not the literal payload string.
-	certPem := []byte("-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n")
-	keyPem := []byte("-----BEGIN PRIVATE KEY-----\nMIIE\n-----END PRIVATE KEY-----\n")
 
 	cert := &cmapi.Certificate{
 		ObjectMeta: metav1.ObjectMeta{
@@ -244,8 +239,9 @@ func TestReconcile_HappyPath(t *testing.T) {
 }
 
 func TestReconcile_ClusterIssuerFanOut(t *testing.T) {
-	certPemEscaped := `-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----`
-	keyPemEscaped := `-----BEGIN PRIVATE KEY-----\nMIIE\n-----END PRIVATE KEY-----`
+	certPem, keyPem := mustGenerateTestCertForController(t)
+	certPemEscaped := strings.ReplaceAll(string(certPem), "\n", "\\n")
+	keyPemEscaped := strings.ReplaceAll(string(keyPem), "\n", "\\n")
 	payload := []byte(`{"certificate":"` + certPemEscaped + `","private_key":"` + keyPemEscaped + `"}`)
 
 	cert := &cmapi.Certificate{
@@ -320,8 +316,9 @@ func TestReconcile_ClusterIssuerFanOut(t *testing.T) {
 }
 
 func TestReconcile_ClusterIssuerFanOut_NamespaceFilter(t *testing.T) {
-	certPemEscaped := `-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----`
-	keyPemEscaped := `-----BEGIN PRIVATE KEY-----\nMIIE\n-----END PRIVATE KEY-----`
+	certPem, keyPem := mustGenerateTestCertForController(t)
+	certPemEscaped := strings.ReplaceAll(string(certPem), "\n", "\\n")
+	keyPemEscaped := strings.ReplaceAll(string(keyPem), "\n", "\\n")
 	payload := []byte(`{"certificate":"` + certPemEscaped + `","private_key":"` + keyPemEscaped + `"}`)
 
 	cert := &cmapi.Certificate{
@@ -367,6 +364,92 @@ func TestReconcile_ClusterIssuerFanOut_NamespaceFilter(t *testing.T) {
 		if err := r.Get(context.Background(), types.NamespacedName{Name: "tls-out", Namespace: ns}, &got); err == nil {
 			t.Fatalf("secret unexpectedly written to %s (not in allow-list)", ns)
 		}
+	}
+}
+
+// TestReconcile_FanOutContinuesAfterOneNamespaceFails proves a write
+// failure in one target namespace doesn't abort the rest of the fan-out —
+// every other namespace must still get the fresh (post-drift) secret data
+// in the same reconcile pass, not stale data until the next retry.
+func TestReconcile_FanOutContinuesAfterOneNamespaceFails(t *testing.T) {
+	certPem, keyPem := mustGenerateTestCertForController(t)
+	certPemEscaped := strings.ReplaceAll(string(certPem), "\n", "\\n")
+	keyPemEscaped := strings.ReplaceAll(string(keyPem), "\n", "\\n")
+	payload := []byte(`{"certificate":"` + certPemEscaped + `","private_key":"` + keyPemEscaped + `"}`)
+
+	cert := &cmapi.Certificate{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "c1",
+			Namespace: "ns-cert",
+			Annotations: map[string]string{
+				AnnotationSecretName: "cloud/secret",
+			},
+		},
+		Spec: cmapi.CertificateSpec{
+			IssuerRef:  cmmeta.ObjectReference{Name: "aws-ci", Kind: "AWSSecretManagerClusterIssuer"},
+			SecretName: "tls-out",
+		},
+	}
+	nsCert := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "ns-cert"}}
+	nsA := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "ns-a"}}
+	nsB := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "ns-b"}}
+
+	scheme := runtime.NewScheme()
+	if err := cmapi.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	cli := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cert, nsCert, nsA, nsB).
+		WithStatusSubresource(&cmapi.Certificate{}).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+				if s, ok := obj.(*corev1.Secret); ok && s.Namespace == "ns-a" {
+					return errors.New("injected create failure for ns-a")
+				}
+				return c.Create(ctx, obj, opts...)
+			},
+		}).
+		Build()
+	r := &IssuerReconciler{Client: cli, Scheme: scheme}
+	r.ProviderResolvers = map[string]SecretResolver{
+		"AWSSecretManagerClusterIssuer": func(ctx context.Context, ref string) ([]byte, error) {
+			return payload, nil
+		},
+	}
+	r.IssuerConfigFromIssuer = func(ctx context.Context, c *cmapi.Certificate) (api.IssuerConfig, error) {
+		return api.IssuerConfig{}, nil
+	}
+
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "c1", Namespace: "ns-cert"}}); err != nil {
+		t.Fatalf("Reconcile error: %v", err)
+	}
+
+	// ns-b must still get the secret even though ns-a's write failed —
+	// the loop must not abort on the first error.
+	var secB corev1.Secret
+	if err := r.Get(context.Background(), types.NamespacedName{Name: "tls-out", Namespace: "ns-b"}, &secB); err != nil {
+		t.Fatalf("ns-b secret missing (fan-out aborted early): %v", err)
+	}
+	var secCert corev1.Secret
+	if err := r.Get(context.Background(), types.NamespacedName{Name: "tls-out", Namespace: "ns-cert"}, &secCert); err != nil {
+		t.Fatalf("ns-cert secret missing (fan-out aborted early): %v", err)
+	}
+
+	// ns-a itself never got its secret, and the Certificate must report drift.
+	var secA corev1.Secret
+	if err := r.Get(context.Background(), types.NamespacedName{Name: "tls-out", Namespace: "ns-a"}, &secA); err == nil {
+		t.Fatal("ns-a secret unexpectedly present despite injected write failure")
+	}
+	var got cmapi.Certificate
+	if err := r.Get(context.Background(), types.NamespacedName{Name: "c1", Namespace: "ns-cert"}, &got); err != nil {
+		t.Fatal(err)
+	}
+	if firstReason(&got) != "SecretWriteFailed" {
+		t.Fatalf("reason = %q, want SecretWriteFailed", firstReason(&got))
 	}
 }
 
@@ -419,6 +502,180 @@ func TestReconcile_GeneratesKeystores(t *testing.T) {
 	}
 	if err := keystore.ParseJKSForTest(sec.Data["keystore.jks"], sec.Data["keystore.password"]); err != nil {
 		t.Errorf("JKS load failed: %v", err)
+	}
+}
+
+// TestReconcile_EndToEnd_CompletesChainWithKnownRoot verifies the same gap
+// found in CertSyncer also applied to IssuerReconciler: a source that ships
+// leaf+intermediate but no root must still get the root appended to ca.crt,
+// the chain annotation, and the keystore — not just tls.crt.
+func TestReconcile_EndToEnd_CompletesChainWithKnownRoot(t *testing.T) {
+	rootPEM, rootCert, rootKey := genCert(t, "sample-root-ca", true, nil, nil)
+	intermediatePEM, interCert, interKey := genCert(t, "sample-intermediate", true, rootCert, rootKey)
+	leafPEM, _, leafKey := genCert(t, "e2e-root.example.com", false, interCert, interKey)
+	leafKeyDER, err := x509.MarshalPKCS8PrivateKey(leafKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leafKeyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: leafKeyDER})
+
+	origRoots := knownRoots
+	knownRoots = [][]byte{rootPEM}
+	defer func() { knownRoots = origRoots }()
+
+	esc := func(b []byte) string { return strings.ReplaceAll(string(b), "\n", "\\n") }
+	payload := []byte(`{"certificate":"` + esc(leafPEM) +
+		`","private_key":"` + esc(leafKeyPEM) +
+		`","certificate_chain":"` + esc(intermediatePEM) + `"}`)
+
+	cert := &cmapi.Certificate{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "e2e-root-cert",
+			Namespace: "ns1",
+			Annotations: map[string]string{
+				AnnotationSecretName: "cloud/secret-e2e-root",
+			},
+		},
+		Spec: cmapi.CertificateSpec{
+			IssuerRef:  cmmeta.ObjectReference{Name: "aws-iss", Kind: "AWSIssuer"},
+			SecretName: "tls-e2e-root",
+		},
+	}
+	r := newTestReconciler(t, cert)
+	r.ProviderResolvers = map[string]SecretResolver{
+		"AWSIssuer": func(ctx context.Context, ref string) ([]byte, error) {
+			return payload, nil
+		},
+	}
+	r.IssuerConfigFromIssuer = func(ctx context.Context, c *cmapi.Certificate) (api.IssuerConfig, error) {
+		return api.IssuerConfig{}, nil
+	}
+
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "e2e-root-cert", Namespace: "ns1"}}); err != nil {
+		t.Fatalf("Reconcile error: %v", err)
+	}
+
+	var sec corev1.Secret
+	if err := r.Get(context.Background(), types.NamespacedName{Name: "tls-e2e-root", Namespace: "ns1"}, &sec); err != nil {
+		t.Fatal(err)
+	}
+
+	wantChain := NormalizePEM(append(append([]byte{}, intermediatePEM...), rootPEM...))
+	if string(sec.Data[corev1.ServiceAccountRootCAKey]) != string(wantChain) {
+		t.Errorf("ca.crt = %q, want intermediate+root %q", sec.Data[corev1.ServiceAccountRootCAKey], wantChain)
+	}
+	if got := sec.Annotations[AnnotationChain]; got != "leaf|intermediate|root" {
+		t.Errorf("chain annotation = %q, want %q", got, "leaf|intermediate|root")
+	}
+	if len(sec.Data["keystore.jks"]) == 0 {
+		t.Fatal("keystore.jks missing")
+	}
+	if err := keystore.ParseJKSForTest(sec.Data["keystore.jks"], sec.Data["keystore.password"]); err != nil {
+		t.Fatalf("JKS load failed: %v", err)
+	}
+}
+
+// TestReconcile_EndToEnd_SamplePEMProducesValidSecret feeds a realistic
+// root-CA + leaf PEM chain through the full Reconcile path (chain
+// validation, keystore build, post-write verify, cert-id annotation) and
+// asserts every field of the produced Secret — this is the "sample PEM in,
+// Secret out" check, not just an individual unit.
+func TestReconcile_EndToEnd_SamplePEMProducesValidSecret(t *testing.T) {
+	rootPEM, rootCert, rootKey := genCert(t, "sample-root-ca", true, nil, nil)
+	leafPEM, _, leafKey := genCert(t, "e2e.example.com", false, rootCert, rootKey)
+	leafKeyDER, err := x509.MarshalPKCS8PrivateKey(leafKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leafKeyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: leafKeyDER})
+
+	esc := func(b []byte) string { return strings.ReplaceAll(string(b), "\n", "\\n") }
+	payload := []byte(`{"certificate":"` + esc(leafPEM) +
+		`","private_key":"` + esc(leafKeyPEM) +
+		`","certificate_chain":"` + esc(rootPEM) + `"}`)
+
+	cert := &cmapi.Certificate{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "e2e-cert",
+			Namespace: "ns1",
+			Annotations: map[string]string{
+				AnnotationSecretName: "cloud/secret-e2e",
+			},
+		},
+		Spec: cmapi.CertificateSpec{
+			IssuerRef:  cmmeta.ObjectReference{Name: "aws-iss", Kind: "AWSIssuer"},
+			SecretName: "tls-e2e",
+		},
+	}
+	r := newTestReconciler(t, cert)
+	r.ProviderResolvers = map[string]SecretResolver{
+		"AWSIssuer": func(ctx context.Context, ref string) ([]byte, error) {
+			return payload, nil
+		},
+	}
+	r.IssuerConfigFromIssuer = func(ctx context.Context, c *cmapi.Certificate) (api.IssuerConfig, error) {
+		return api.IssuerConfig{}, nil
+	}
+
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "e2e-cert", Namespace: "ns1"}}); err != nil {
+		t.Fatalf("Reconcile error: %v", err)
+	}
+
+	var sec corev1.Secret
+	if err := r.Get(context.Background(), types.NamespacedName{Name: "tls-e2e", Namespace: "ns1"}, &sec); err != nil {
+		t.Fatal(err)
+	}
+
+	// TLS payload: leaf cert, leaf key, root chain.
+	if string(sec.Data[corev1.TLSCertKey]) != string(NormalizePEM(leafPEM)) {
+		t.Errorf("tls.crt mismatch")
+	}
+	if string(sec.Data[corev1.TLSPrivateKeyKey]) != string(NormalizePEM(leafKeyPEM)) {
+		t.Errorf("tls.key mismatch")
+	}
+	if string(sec.Data[corev1.ServiceAccountRootCAKey]) != string(NormalizePEM(rootPEM)) {
+		t.Errorf("ca.crt (chain) mismatch")
+	}
+	if sec.Type != corev1.SecretTypeTLS {
+		t.Errorf("type = %v, want TLS", sec.Type)
+	}
+
+	// Keystores: present and load with the shipped password.
+	if len(sec.Data["keystore.jks"]) == 0 || len(sec.Data["keystore.p12"]) == 0 || len(sec.Data["keystore.password"]) == 0 {
+		t.Fatal("keystore.jks/p12/password missing")
+	}
+	if err := keystore.ParseJKSForTest(sec.Data["keystore.jks"], sec.Data["keystore.password"]); err != nil {
+		t.Errorf("JKS load failed: %v", err)
+	}
+
+	// Annotations: leaf-derived metadata, issuer identity, cert-id, hashes.
+	wantAnnotations := map[string]string{
+		"cert-manager.io/common-name":  "e2e.example.com",
+		"cert-manager.io/issuer-name":  "aws-iss",
+		"cert-manager.io/issuer-kind":  "AWSIssuer",
+		"cert-manager.io/issuer-group": "cert-manager.io",
+		AnnotationSecretName:           "cloud/secret-e2e",
+	}
+	for k, want := range wantAnnotations {
+		if got := sec.Annotations[k]; got != want {
+			t.Errorf("annotation %s = %q, want %q", k, got, want)
+		}
+	}
+	if sec.Annotations[AnnotationSourceHash] == "" {
+		t.Error("source-hash annotation missing")
+	}
+	if sec.Annotations[AnnotationSecretHash] == "" {
+		t.Error("secret-hash annotation missing")
+	}
+
+	// Certificate status: Ready=True, Synced — proves chain validation and
+	// post-write verify both passed for this sample input.
+	var gotCert cmapi.Certificate
+	if err := r.Get(context.Background(), types.NamespacedName{Name: "e2e-cert", Namespace: "ns1"}, &gotCert); err != nil {
+		t.Fatal(err)
+	}
+	if firstReason(&gotCert) != "Synced" || gotCert.Status.Conditions[0].Status != cmmeta.ConditionTrue {
+		t.Fatalf("Certificate status = %+v, want Ready/Synced/True", gotCert.Status.Conditions)
 	}
 }
 

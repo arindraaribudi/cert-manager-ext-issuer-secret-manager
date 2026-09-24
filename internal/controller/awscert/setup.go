@@ -14,7 +14,11 @@ import (
 // guard, any cert-manager Certificate carrying the annotation would wake us.
 func (r *IssuerReconciler) matches(obj client.Object) bool {
 	c, ok := obj.(*cmapi.Certificate)
-	return ok && c.Spec.IssuerRef.Group == "certificates.cert-manager.io" && hasARNAnnotation(obj)
+	if !ok {
+		return false
+	}
+	v, hasAnn := c.GetAnnotations()[AnnotationARN]
+	return c.Spec.IssuerRef.Group == "certificates.cert-manager.io" && hasAnn && v != ""
 }
 
 func (r *IssuerReconciler) SetupWithManager(mgr ctrl.Manager) error {
