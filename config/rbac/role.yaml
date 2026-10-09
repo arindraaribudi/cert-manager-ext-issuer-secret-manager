@@ -26,6 +26,9 @@ rules:
     - "tencentsecretmanagerissuers/status"
     - "tencentsecretmanagerclusterissuers"
     - "tencentsecretmanagerclusterissuers/status"
+    - "awssecretmanagercasources"
+    - "gcpsecretmanagercasources"
+    - "tencentsecretmanagercasources"
   verbs: ["get", "list", "watch", "update", "patch"]
 # Sign virtual resource: cert-manager performs a SubjectAccessReview on
 # `signers` named <plural>.<group>/<issuer-name> to confirm this controller

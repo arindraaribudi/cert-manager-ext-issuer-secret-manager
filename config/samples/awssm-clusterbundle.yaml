@@ -1,0 +1,8 @@
+apiVersion: trust.cert-manager.io/v1alpha2
+kind: ClusterBundle
+metadata:
+  name: aws-roots
+spec:
+  sourceRefs:
+    - kind: Secret
+      name: aws-roots

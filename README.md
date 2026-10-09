@@ -81,6 +81,30 @@ The cloud-side secret should be JSON:
 ```
 Keys are configurable per Issuer via `spec.payloadKeys`.
 
+### Payload shapes
+
+The cloud-side secret is one of three shapes — every field is optional
+except the one(s) you need for your consumer:
+
+| shape | fields | use case |
+| --- | --- | --- |
+| full | `certificate`, `private_key`, `certificate_chain` | leaf + key + CA bundle (typical mTLS client/server) |
+| keyless | `certificate`, `certificate_chain` | leaf + CA bundle, no key (server cert the controller only mirrors) |
+| truststore-only | `certificate_chain` | CA bundle only — no leaf, no key |
+
+`jks2secret` emits all three (see [Offline Secret generation](#offline-secret-generation-jks2secret)).
+For a hand-written payload, the truststore-only shape from a single
+`CARoot.pem` looks like:
+
+```json
+{
+  "certificate_chain": "-----BEGIN CERTIFICATE-----\nMIIDfT...\n-----END CERTIFICATE-----\n"
+}
+```
+
+Concatenate multiple PEMs (root + intermediates) into one
+`certificate_chain` string, `\n`-separated, leaf excluded.
+
 ## Offline Secret generation (`jks2secret`)
 
 Standalone CLI for producing the AWS Secrets Manager / GCP Secret

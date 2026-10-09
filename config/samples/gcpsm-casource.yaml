@@ -1,0 +1,10 @@
+apiVersion: secret-manager.cert-manager.io/v1alpha1
+kind: GCPSecretManagerCASource
+metadata:
+  name: gcp-roots
+spec:
+  project: my-gcp-project
+  secretName: my-ca-bundle
+  target:
+    namespace: cert-manager
+    name: gcp-roots

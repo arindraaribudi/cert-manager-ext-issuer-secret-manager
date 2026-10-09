@@ -1,0 +1,13 @@
+apiVersion: trust.cert-manager.io/v1alpha1
+kind: Bundle
+metadata:
+  name: tencent-roots
+  namespace: cert-manager
+spec:
+  sources:
+    - secret:
+        name: tencent-roots
+        key: ca.crt
+  target:
+    secret:
+      key: ca.crt

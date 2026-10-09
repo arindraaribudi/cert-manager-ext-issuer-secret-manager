@@ -1,0 +1,10 @@
+apiVersion: secret-manager.cert-manager.io/v1alpha1
+kind: TencentSecretManagerCASource
+metadata:
+  name: tencent-roots
+spec:
+  region: ap-hongkong
+  secretName: my-ca-bundle
+  target:
+    namespace: cert-manager
+    name: tencent-roots

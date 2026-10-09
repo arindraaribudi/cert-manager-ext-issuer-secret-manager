@@ -32,6 +32,7 @@ import (
 	awscertpkg "github.com/arindraaribudi/cert-manager-ext-issuer-secret-manager/internal/awscert"
 	"github.com/arindraaribudi/cert-manager-ext-issuer-secret-manager/internal/controller"
 	awscertctrl "github.com/arindraaribudi/cert-manager-ext-issuer-secret-manager/internal/controller/awscert"
+	"github.com/arindraaribudi/cert-manager-ext-issuer-secret-manager/internal/controller/casource"
 	tencentcertctrl "github.com/arindraaribudi/cert-manager-ext-issuer-secret-manager/internal/controller/tencentcert"
 	"github.com/arindraaribudi/cert-manager-ext-issuer-secret-manager/internal/gcp"
 	"github.com/arindraaribudi/cert-manager-ext-issuer-secret-manager/internal/tencentcert"
@@ -153,6 +154,40 @@ func Run(ctx context.Context, opts Options) error {
 	}
 	if err := tcCertRec.SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("setup tencentcert controller: %w", err)
+	}
+
+	// CASource controllers — trust-manager CA bundles from cloud SM.
+	awsCASrc := &casource.AWSReconciler{
+		Reconciler: &casource.Reconciler{
+			Client: mgr.GetClient(),
+			Prefix: "aws",
+			Fetch:  casource.NewAWSFetch(mgr.GetClient(), opts.CertManagerNamespace),
+		},
+	}
+	if err := awsCASrc.SetupWithManager(mgr); err != nil {
+		return fmt.Errorf("setup awscasource controller: %w", err)
+	}
+
+	gcpCASrc := &casource.GCPReconciler{
+		Reconciler: &casource.Reconciler{
+			Client: mgr.GetClient(),
+			Prefix: "gcp",
+			Fetch:  casource.NewGCPFetch(),
+		},
+	}
+	if err := gcpCASrc.SetupWithManager(mgr); err != nil {
+		return fmt.Errorf("setup gcpcasource controller: %w", err)
+	}
+
+	tcCASrc := &casource.TencentReconciler{
+		Reconciler: &casource.Reconciler{
+			Client: mgr.GetClient(),
+			Prefix: "tencent",
+			Fetch:  casource.NewTencentFetch(mgr.GetClient(), opts.CertManagerNamespace),
+		},
+	}
+	if err := tcCASrc.SetupWithManager(mgr); err != nil {
+		return fmt.Errorf("setup tencentcasource controller: %w", err)
 	}
 
 	if err := mgr.Add(&controller.Resyncer{

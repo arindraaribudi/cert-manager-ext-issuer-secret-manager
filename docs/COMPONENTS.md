@@ -74,6 +74,11 @@ Reconcile flow:
 | GCP client | `internal/gcp/client.go` | Real `secretmanager` client (same status as AWS). |
 | Tencent client | `internal/tencent/client.go` | Adapter; real SDK wiring tracked in follow-up. |
 | CRDs | `api/v1alpha1/` | `AWSSecretManagerIssuer`, `AWSSecretManagerClusterIssuer`, `GCPSecretManagerIssuer`, `GCPSecretManagerClusterIssuer`, `TencentSecretManagerIssuer`, `TencentSecretManagerClusterIssuer`. |
+| CASource CRDs | `api/v1alpha1/casource_types.go` | `AWSSecretManagerCASource`, `GCPSecretManagerCASource`, `TencentSecretManagerCASource` — cluster-scoped, fetch a CA PEM bundle and write it as an `Opaque` Secret for trust-manager to consume. |
+| CASource reconciler (shared) | `internal/controller/casource/casource.go` | `ReconcileInput` → `Fetch` → `extractChain` → write Opaque → status. Owns the source-hash / last-sync-time annotations. |
+| CASource reconciler (AWS) | `internal/controller/casource/aws.go` | `AWSReconciler` + `NewAWSFetch`. SDK client cached by `region\|endpoint`; static-creds path via `awscertpkg.LoadStaticCredentials`. |
+| CASource reconciler (GCP) | `internal/controller/casource/gcp.go` | `GCPReconciler` + `NewGCPFetch`. Per-call client construction; resource name `projects/P/secret/S/versions/latest`; ADC chain. |
+| CASource reconciler (Tencent) | `internal/controller/casource/tencent.go` | `TencentReconciler` + `NewTencentFetch`. SDK client cached by `region\|endpoint`; TKE OIDC via `tencent.ResolveCredential` or static AK/SK fallback. |
 | RBAC | `config/rbac/role.yaml` | `ClusterRole` `cert-manager-ext-issuer-secret-manager`. |
 
 ### CRD spec shape (per-issuer; AWS example)

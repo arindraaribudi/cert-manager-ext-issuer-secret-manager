@@ -1,0 +1,8 @@
+apiVersion: trust.cert-manager.io/v1alpha2
+kind: ClusterBundle
+metadata:
+  name: gcp-roots
+spec:
+  sourceRefs:
+    - kind: Secret
+      name: gcp-roots

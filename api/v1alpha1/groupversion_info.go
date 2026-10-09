@@ -27,5 +27,9 @@ func init() {
 		// Tencent
 		&TencentSecretManagerIssuer{}, &TencentSecretManagerIssuerList{},
 		&TencentSecretManagerClusterIssuer{}, &TencentSecretManagerClusterIssuerList{},
+		// CASource — trust-manager CAs sourced from cloud Secret Managers
+		&AWSSecretManagerCASource{}, &AWSSecretManagerCASourceList{},
+		&GCPSecretManagerCASource{}, &GCPSecretManagerCASourceList{},
+		&TencentSecretManagerCASource{}, &TencentSecretManagerCASourceList{},
 	)
 }

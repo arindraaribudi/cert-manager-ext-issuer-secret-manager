@@ -329,6 +329,105 @@ cloud store.
    controller doesn't write to them. Users watch the Certificate's
    `Ready` condition instead.
 
+## CASource — trust-manager CAs sourced from cloud Secret Managers
+
+Three cluster-scoped CRDs (`AWSSecretManagerCASource`, `GCPSecretManagerCASource`,
+`TencentSecretManagerCASource`) fetch a CA PEM bundle from a cloud Secret
+Manager and write it into a same-cluster `Opaque` k8s `Secret` as
+`data["ca.crt"]`. [trust-manager](https://cert-manager.io/docs/trust/)
+references that Secret from a `Bundle` (v1alpha1) or `ClusterBundle` (v1alpha2).
+
+**Why a separate CRD?** trust-manager's `Bundle.spec.sources` (v1alpha1) and
+`ClusterBundle.spec.sourceRefs` (v1alpha2) are enum-limited to
+`ConfigMap` / `Secret` / `InLine` / `UseDefaultCAs`. No plugin, no webhook
+receiver, no SPI. The only way to feed external CAs is to materialize
+them into a k8s `Secret` and reference that Secret. CASource is the
+materializer.
+
+### Spec
+
+| Field | AWS / Tencent | GCP | Purpose |
+|---|---|---|---|
+| `region` | required | n/a | Cloud region for the SDK client |
+| `project` | n/a | required | GCP project ID |
+| `secretRef` | optional | n/a | k8s `Secret` holding credentials; nil → pod identity (IRSA / Workload Identity / TKE OIDC) |
+| `endpoint` | optional | optional | Override SDK default API endpoint (VPC / LocalStack / China partition) |
+| `secretName` | required | required | Cloud-side secret name (the CA bundle) |
+| `target.namespace` | optional | optional | k8s namespace of the target Secret; default `cert-manager` |
+| `target.name` | required | required | k8s `Secret` name; trust-manager Bundle references this |
+| `resyncInterval` | optional | optional | Drift-check cadence; default `24h` |
+
+### Status
+
+| Field | Purpose |
+|---|---|
+| `conditions[]` | `Ready` condition (True/False) with reason + message |
+| `sourceHash` | SHA-256 of the fetched PEM; same value stamped on the target Secret's `external-issuer.cert-manager.io/source-hash` annotation |
+| `lastSyncTime` | RFC3339 UTC timestamp of the last successful sync |
+
+### Cloud payload (CA-only)
+
+CASource only reads the `certificate_chain` field. Cloud-side secret:
+
+```json
+{
+  "certificate_chain": "-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----\n"
+}
+```
+
+The `certificate` and `private_key` fields are ignored. CASource has
+its own 8-line JSON parser; the existing `parse.Extract` (post-revert
+`e831dc8`) requires both, which is wrong for a CA-only payload.
+
+### Output Secret
+
+- `Type: Opaque` (NOT `kubernetes.io/tls` — `tls.key` would be required
+  and empty; k8s admission rejects the latter).
+- `data["ca.crt"]` = full PEM chain.
+- Annotations: `external-issuer.cert-manager.io/source-hash`,
+  `external-issuer.cert-manager.io/last-sync-time`.
+- Default target namespace: `cert-manager`.
+
+### Identity
+
+- **AWS**: ServiceAccount annotation `eks.amazonaws.com/role-arn`. SDK
+  chain reads `AWS_ROLE_ARN` + `AWS_WEB_IDENTITY_TOKEN_FILE` (IRSA) or
+  `AWS_CONTAINER_CREDENTIALS_FULL_URI` (EKS Pod Identity).
+- **GCP**: ServiceAccount annotation `iam.gke.io/gcp-service-account`.
+  ADC walks to GKE metadata server. No env, no volume.
+- **Tencent**: ServiceAccount annotation `eks.tke.cloud.tencent.com/role-arn`.
+  SDK reads `TKE_REGION` + `TKE_WEB_IDENTITY_TOKEN_FILE` injected by TKE.
+  `internal/tencent/client.go:111` already detects + wires this.
+
+`Spec.SecretRef` → static creds fallback (existing k8s `Secret` pattern).
+
+### trust-manager handoff
+
+```yaml
+# v1alpha1 Bundle (namespaced)
+apiVersion: trust.cert-manager.io/v1alpha1
+kind: Bundle
+metadata: {name: aws-roots, namespace: cert-manager}
+spec:
+  sources:
+    - secret: {name: aws-roots, key: ca.crt}
+  target:
+    secret: {key: ca.crt}
+```
+
+```yaml
+# v1alpha2 ClusterBundle (cluster-wide)
+apiVersion: trust.cert-manager.io/v1alpha2
+kind: ClusterBundle
+metadata: {name: aws-roots}
+spec:
+  sourceRefs:
+    - kind: Secret
+      name: aws-roots
+```
+
+Sample manifests in `config/samples/{aws,gcp,tencent}sm-{casource,bundle,clusterbundle}.yaml`.
+
 ## Certificate download controllers (ACM / Tencent SSL)
 
 A second CRD group — `certificates.cert-manager.io/v1alpha1` — mirrors

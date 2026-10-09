@@ -1,0 +1,10 @@
+apiVersion: secret-manager.cert-manager.io/v1alpha1
+kind: AWSSecretManagerCASource
+metadata:
+  name: aws-roots
+spec:
+  region: us-east-1
+  secretName: my-ca-bundle
+  target:
+    namespace: cert-manager
+    name: aws-roots
