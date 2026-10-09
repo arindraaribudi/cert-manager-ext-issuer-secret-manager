@@ -8,10 +8,12 @@ package keystore
 import (
 	"bytes"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/pem"
 	"fmt"
+	"log"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -167,14 +169,17 @@ func aliasFor(leaf *x509.Certificate) string {
 }
 
 // parseChainDER splits chainPEM into one or more *x509.Certificate
-// values. Malformed blocks are skipped (logged via error return when
-// no valid certs found). Empty input returns an empty slice.
+// values. Malformed blocks are logged and skipped; duplicates (by
+// SHA-256 of the DER bytes) are deduped silently. Returns an error
+// only when the input contained blocks but NONE parsed as certificates.
 func parseChainDER(chainPEM []byte) ([]x509.Certificate, error) {
 	if len(chainPEM) == 0 {
 		return nil, nil
 	}
 	var out []x509.Certificate
+	seen := make(map[[32]byte]bool)
 	rest := chainPEM
+	var skipped, duped int
 	for {
 		var block *pem.Block
 		block, rest = pem.Decode(rest)
@@ -186,14 +191,23 @@ func parseChainDER(chainPEM []byte) ([]x509.Certificate, error) {
 		}
 		c, err := x509.ParseCertificate(block.Bytes)
 		if err != nil {
-			// Skip malformed blocks — callers already have a leaf cert
-			// in hand and a partial chain beats no chain.
+			skipped++
+			log.Printf("keystore: skipping malformed CERTIFICATE block in chain: %v", err)
 			continue
 		}
+		fp := sha256.Sum256(c.Raw)
+		if seen[fp] {
+			duped++
+			continue
+		}
+		seen[fp] = true
 		out = append(out, *c)
 	}
-	if out == nil && len(chainPEM) > 0 {
-		return nil, fmt.Errorf("keystore: chain PEM had blocks but none parsed as certificates")
+	if skipped > 0 || duped > 0 {
+		log.Printf("keystore: chain parse complete: %d certs kept, %d malformed skipped, %d duplicates dropped", len(out), skipped, duped)
+	}
+	if len(out) == 0 && len(chainPEM) > 0 {
+		return nil, fmt.Errorf("keystore: chain PEM had %d CERTIFICATE block(s) but none parsed", skipped)
 	}
 	return out, nil
 }

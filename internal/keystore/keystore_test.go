@@ -223,6 +223,30 @@ func TestParseChainDER_MultipleBlocks(t *testing.T) {
 	}
 }
 
+// TestParseChainDER_DedupsAndSkipsMalformed guards the contract: duplicate
+// DER certs collapse to one entry (avoids bloated JKS trust entries +
+// PKCS#12 chain), and malformed blocks no longer fail silently — they
+// must not lose valid neighbours (regression for the silent-truncation
+// bug found when the fixture's CertificateChain contained a no-separator
+// cert block).
+func TestParseChainDER_DedupsAndSkipsMalformed(t *testing.T) {
+	goodA, _ := mustTestCert(t, "a")
+	goodB, _ := mustTestCert(t, "b")
+	// Duplicate goodA twice, then a malformed block (truncated DER),
+	// then goodB again.
+	truncated := []byte("-----BEGIN CERTIFICATE-----\nMIIBfakebadcertnotreallyvalid\n-----END CERTIFICATE-----\n")
+	bundle := append(append(append(append([]byte{}, goodA...), goodB...), goodA...), truncated...)
+	bundle = append(bundle, goodB...)
+
+	certs, err := parseChainDER(bundle)
+	if err != nil {
+		t.Fatalf("parseChainDER: %v", err)
+	}
+	if len(certs) != 2 {
+		t.Fatalf("got %d certs, want 2 (a, b — malformed skipped, duplicates dropped)", len(certs))
+	}
+}
+
 func mustParseLeaf(t *testing.T, certPEM []byte) *x509.Certificate {
 	t.Helper()
 	block, _ := pem.Decode(certPEM)
