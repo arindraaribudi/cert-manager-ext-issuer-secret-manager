@@ -12,11 +12,16 @@ import (
 )
 
 // New builds a Secret Manager client. If adcJSON is non-empty it's used as
-// ADC credentials (else Workload Identity / ADC chain).
-func New(ctx context.Context, adcJSON []byte) (*secretmanager.Client, error) {
+// ADC credentials (else Workload Identity / ADC chain). endpoint "" →
+// SDK default. Pass non-empty for VPC-SC service connectivity, Private
+// Google Access, or non-GCP compatible test endpoints.
+func New(ctx context.Context, adcJSON []byte, endpoint string) (*secretmanager.Client, error) {
 	var opts []option.ClientOption
 	if len(adcJSON) > 0 {
 		opts = append(opts, option.WithCredentialsJSON(adcJSON)) //nolint:staticcheck // SA1019: ADC JSON path; replace when SDK ships non-deprecated constructor
+	}
+	if endpoint != "" {
+		opts = append(opts, option.WithEndpoint(endpoint))
 	}
 	cli, err := secretmanager.NewClient(ctx, opts...)
 	if err != nil {

@@ -22,7 +22,9 @@ import (
 	tcssm "github.com/tencentcloud/tencentcloud-sdk-go-intl-en/tencentcloud/ssm/v20190923"
 )
 
-// New builds a Tencent SSM SDK client. Endpoint "" → ssm.tencentcloudapi.com.
+// New builds a Tencent SSM SDK client. Endpoint "" → ssm.intl.tencentcloudapi.com
+// (the intl-en SDK's home partition; matches tccli for intl accounts).
+// CN users can override with `ssm.tencentcloudapi.com` via the issuer spec.
 // cred is any common.CredentialIface — static, TKE OIDC, or chained.
 func New(ctx context.Context, region string, cred tccommon.CredentialIface, endpoint string) (*tcssm.Client, error) {
 	if region == "" {
@@ -32,7 +34,7 @@ func New(ctx context.Context, region string, cred tccommon.CredentialIface, endp
 		return nil, fmt.Errorf("tencent: credential required")
 	}
 	if endpoint == "" {
-		endpoint = "ssm.tencentcloudapi.com"
+		endpoint = "ssm.intl.tencentcloudapi.com"
 	}
 	prof := tcprofile.NewClientProfile()
 	prof.HttpProfile.Endpoint = endpoint

@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/secretsmanager"
 )
@@ -16,12 +17,19 @@ type Client struct {
 
 // New builds a Secrets Manager client for the given region.
 // Credentials come from the default SDK chain (env / shared config / IRSA).
-func New(ctx context.Context, region string) (*Client, error) {
+// endpoint "" → SDK's region-based default. Pass non-empty for VPC endpoints,
+// LocalStack, or non-AWS compatible services.
+func New(ctx context.Context, region, endpoint string) (*Client, error) {
 	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(region))
 	if err != nil {
 		return nil, fmt.Errorf("aws: load config: %w", err)
 	}
-	return &Client{api: secretsmanager.NewFromConfig(cfg)}, nil
+	var opts []func(*secretsmanager.Options)
+	if endpoint != "" {
+		ep := endpoint
+		opts = append(opts, func(o *secretsmanager.Options) { o.BaseEndpoint = aws.String(ep) })
+	}
+	return &Client{api: secretsmanager.NewFromConfig(cfg, opts...)}, nil
 }
 
 // Wrap adapts a prebuilt Secrets Manager client. Use when the caller

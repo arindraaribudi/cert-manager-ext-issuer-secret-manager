@@ -1,0 +1,18 @@
+apiVersion: secret-manager.cert-manager.io/v1alpha1
+kind: TencentSecretManagerClusterIssuer
+metadata:
+  name: tencent-sm
+spec:
+  region: ap-bangkok
+  # secretRef omitted → TKE OIDC pod identity wins when TKE_* env
+  # is bound (see PodIdentityBinding in cert-manager ns).
+  # endpoint: ssm.tencentcloudapi.com   # only set for China-partition accounts;
+  # default is ssm.intl.tencentcloudapi.com (matches the intl-en SDK + tccli).
+---
+# Tencent SSM payload (plaintext or KMS-encrypted at rest). Keys match
+# the controller's default PayloadKeys unless overridden in spec.payloadKeys.
+# {
+#   "certificate": "-----BEGIN CERTIFICATE-----\n...",
+#   "private_key": "-----BEGIN PRIVATE KEY-----\n...",
+#   "certificate_chain": "-----BEGIN CERTIFICATE-----\n..."
+# }

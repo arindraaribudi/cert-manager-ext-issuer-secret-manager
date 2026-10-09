@@ -7,3 +7,4 @@ spec:
   project: "898907061415"
   # secretRef omitted → uses Workload Identity binding on
   # cert-manager/cert-manager-ext-issuer-secret-manager KSA
+  # endpoint: secretmanager.googleapis.com   # optional override (Private Google Access, test target)

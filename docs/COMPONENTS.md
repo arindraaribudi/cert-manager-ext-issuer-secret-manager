@@ -85,6 +85,10 @@ spec:
   secretRef:                 # optional — credentials; omit for IRSA / ADC
     name: aws-creds
     namespace: cert-manager  # resolved to cert ns for Issuer, flag ns for ClusterIssuer
+  endpoint:                  # optional — override SDK default API endpoint
+    # AWS   → VPC endpoint / LocalStack (e.g. https://vpce-xxx.secretsmanager.us-east-1.vpce.amazonaws.com)
+    # GCP   → Private Google Access / test target
+    # Tencent → ssm.tencentcloudapi.com (CN); omit for intl default
   payloadKeys:               # optional overrides
     certificate: certificate
     privateKey: private_key
@@ -112,6 +116,21 @@ Annotations:
 
 - `cert-manager.io/secret-manager-secret-name` — **required**. Cloud-side identifier (AWS SM name, GCP resource name, Tencent cert ID).
 - `cert-manager.io/secret-manager-force-sync` — set to force a re-fetch on next reconcile; cleared after success.
+
+### `spec.endpoint` — partition & override routing
+
+`spec.endpoint` is generic across AWS / GCP / Tencent. Empty → SDK's
+default. Use it for VPC endpoints (AWS), Private Google Access / test
+targets (GCP), or partition overrides (Tencent).
+
+**Tencent partition note** (most common reason to set it): the Tencent
+SDK in this repo is `tencentcloud-sdk-go-intl-en`, so the default
+endpoint is `ssm.intl.tencentcloudapi.com` (international partition —
+matches `tccli` and every other intl product). China-partition accounts
+must set `spec.endpoint: ssm.tencentcloudapi.com` explicitly, otherwise
+SSM returns `ResourceNotFound / can not find secrets` for any secret
+in their account. This is the default for accounts like `ap-shanghai`,
+`ap-guangzhou`, `ap-beijing`, `ap-chengdu`.
 
 ## Install
 
@@ -167,6 +186,7 @@ metadata:
 spec:
   region: us-east-1
   # secretRef omitted → controller uses IRSA / pod identity
+  # endpoint: https://vpce-xxx.secretsmanager.us-east-1.vpce.amazonaws.com  # optional VPC endpoint
 ---
 apiVersion: v1
 kind: Secret
@@ -278,6 +298,9 @@ spec:
   region: ap-shanghai
   secretRef:
     name: tencent-creds
+  # endpoint: ssm.tencentcloudapi.com   # only set for China-partition accounts
+                                      # default is ssm.intl.tencentcloudapi.com
+                                      # (matches the intl-en SDK + tccli)
 ---
 apiVersion: cert-manager.io/v1
 kind: Certificate

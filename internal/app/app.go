@@ -38,7 +38,6 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/service/acm"
 	"github.com/aws/aws-sdk-go-v2/service/secretsmanager"
-	secretmanager "cloud.google.com/go/secretmanager/apiv1"
 	tccommon "github.com/tencentcloud/tencentcloud-sdk-go-intl-en/tencentcloud/common"
 	tcprofile "github.com/tencentcloud/tencentcloud-sdk-go-intl-en/tencentcloud/common/profile"
 	tcssl "github.com/tencentcloud/tencentcloud-sdk-go-intl-en/tencentcloud/ssl/v20191205"
@@ -94,7 +93,7 @@ func BuildIssuerResolvers(ctx context.Context, kube client.Client, cmNamespace s
 	resolvers["AWSSecretManagerClusterIssuer"] = resolvers["AWSSecretManagerIssuer"]
 
 	// GCP
-	resolvers["GCPSecretManagerIssuer"] = gcpResolver(ctx)
+	resolvers["GCPSecretManagerIssuer"] = gcpResolver(ctx, kube, cmNamespace)
 	resolvers["GCPSecretManagerClusterIssuer"] = resolvers["GCPSecretManagerIssuer"]
 
 	// Tencent — real SSM client, cached per (region, creds, endpoint).
@@ -183,19 +182,33 @@ func awsResolver(ctx context.Context, kube client.Client, cmNamespace string) co
 	var mu sync.Mutex
 	cache := map[string]*secretsmanager.Client{}
 	_ = ctx
-	clientFor := func(callCtx context.Context, region, credName, credNS string) (*secretsmanager.Client, error) {
+	// newClient returns a Secrets Manager client honouring spec.Endpoint
+	// (VPC endpoint / LocalStack / non-AWS compatible). Empty endpoint
+	// keeps SDK's region-based default resolution.
+	newClient := func(callCtx context.Context, region, endpoint string) (*secretsmanager.Client, error) {
+		cfg, err := awscertpkg.BuildCredentialConfig(callCtx, region)
+		if err != nil {
+			return nil, fmt.Errorf("aws: load default config for region %q: %w", region, err)
+		}
+		if endpoint != "" {
+			ep := endpoint
+			cfg.BaseEndpoint = &ep
+		}
+		return secretsmanager.NewFromConfig(cfg), nil
+	}
+	clientFor := func(callCtx context.Context, region, credName, credNS, endpoint string) (*secretsmanager.Client, error) {
+		key := region + "|" + endpoint
 		if credName == "" {
 			mu.Lock()
 			defer mu.Unlock()
-			if c, ok := cache[region]; ok {
+			if c, ok := cache[key]; ok {
 				return c, nil
 			}
-			cfg, err := awscertpkg.BuildCredentialConfig(callCtx, region)
+			c, err := newClient(callCtx, region, endpoint)
 			if err != nil {
-				return nil, fmt.Errorf("aws: load default config for region %q: %w", region, err)
+				return nil, err
 			}
-			c := secretsmanager.NewFromConfig(cfg)
-			cache[region] = c
+			cache[key] = c
 			return c, nil
 		}
 		cfg, err := awscertpkg.LoadStaticCredentials(callCtx, kube, credName, credNS)
@@ -207,6 +220,10 @@ func awsResolver(ctx context.Context, kube client.Client, cmNamespace string) co
 		// default — but the default uses the chain's region, which may be unset
 		// when creds come from a static AK/SK pair. Re-pin to the issuer region.
 		cfg.Region = region
+		if endpoint != "" {
+			ep := endpoint
+			cfg.BaseEndpoint = &ep
+		}
 		return secretsmanager.NewFromConfig(cfg), nil
 	}
 	return func(callCtx context.Context, cert *cmapi.Certificate) ([]byte, error) {
@@ -214,11 +231,11 @@ func awsResolver(ctx context.Context, kube client.Client, cmNamespace string) co
 		if !ok {
 			return nil, fmt.Errorf("aws: certificate %s/%s missing annotation %s", cert.Namespace, cert.Name, controller.AnnotationSecretName)
 		}
-		region, credName, credNS, err := awsResolveConfig(callCtx, kube, cert, cmNamespace)
+		region, credName, credNS, endpoint, err := awsResolveConfig(callCtx, kube, cert, cmNamespace)
 		if err != nil {
 			return nil, err
 		}
-		cli, err := clientFor(callCtx, region, credName, credNS)
+		cli, err := clientFor(callCtx, region, credName, credNS, endpoint)
 		if err != nil {
 			return nil, err
 		}
@@ -232,28 +249,28 @@ func awsResolver(ctx context.Context, kube client.Client, cmNamespace string) co
 // otherwise the named Secret must carry access-key-id + secret-access-key.
 // Empty spec.SecretRef.Namespace falls back to cert.Namespace (Issuer) or
 // cmNamespace (ClusterIssuer).
-func awsResolveConfig(ctx context.Context, kube client.Client, cert *cmapi.Certificate, cmNamespace string) (region, credName, credNS string, err error) {
+func awsResolveConfig(ctx context.Context, kube client.Client, cert *cmapi.Certificate, cmNamespace string) (region, credName, credNS, endpoint string, err error) {
 	ref := cert.Spec.IssuerRef
-	var region2 string
+	var region2, endpoint2 string
 	var sref *api.SecretRef
 	switch ref.Kind {
 	case "AWSSecretManagerIssuer":
 		var iss api.AWSSecretManagerIssuer
 		if err := kube.Get(ctx, types.NamespacedName{Name: ref.Name, Namespace: cert.Namespace}, &iss); err != nil {
-			return "", "", "", fmt.Errorf("aws: get AWSSecretManagerIssuer %s/%s: %w", cert.Namespace, ref.Name, err)
+			return "", "", "", "", fmt.Errorf("aws: get AWSSecretManagerIssuer %s/%s: %w", cert.Namespace, ref.Name, err)
 		}
-		region2, sref = iss.Spec.Region, iss.Spec.SecretRef
+		region2, endpoint2, sref = iss.Spec.Region, iss.Spec.Endpoint, iss.Spec.SecretRef
 	case "AWSSecretManagerClusterIssuer":
 		var iss api.AWSSecretManagerClusterIssuer
 		if err := kube.Get(ctx, types.NamespacedName{Name: ref.Name}, &iss); err != nil {
-			return "", "", "", fmt.Errorf("aws: get AWSSecretManagerClusterIssuer %s: %w", ref.Name, err)
+			return "", "", "", "", fmt.Errorf("aws: get AWSSecretManagerClusterIssuer %s: %w", ref.Name, err)
 		}
-		region2, sref = iss.Spec.Region, iss.Spec.SecretRef
+		region2, endpoint2, sref = iss.Spec.Region, iss.Spec.Endpoint, iss.Spec.SecretRef
 	default:
-		return "", "", "", fmt.Errorf("aws: unexpected issuer kind %q", ref.Kind)
+		return "", "", "", "", fmt.Errorf("aws: unexpected issuer kind %q", ref.Kind)
 	}
 	if region2 == "" {
-		return "", "", "", fmt.Errorf("aws: issuer %s/%s missing spec.region", ref.Kind, ref.Name)
+		return "", "", "", "", fmt.Errorf("aws: issuer %s/%s missing spec.region", ref.Kind, ref.Name)
 	}
 	credName2, credNS2 := "", ""
 	if sref != nil {
@@ -268,33 +285,55 @@ func awsResolveConfig(ctx context.Context, kube client.Client, cert *cmapi.Certi
 			}
 		}
 	}
-	return region2, credName2, credNS2, nil
+	return region2, credName2, credNS2, endpoint2, nil
 }
 
-func gcpResolver(ctx context.Context) controller.SecretResolver {
-	var (
-		once     sync.Once
-		initErr  error
-		smClient *secretmanager.Client
-	)
-	bootstrap := func() {
-		cli, err := gcp.New(ctx, nil)
-		if err != nil {
-			initErr = fmt.Errorf("gcp: new client: %w", err)
-			return
-		}
-		smClient = cli
-	}
-	// ponytail: gcpResolver uses project from the Issuer spec — same richer
-	// signature gives it access; wire per-region cache here once the project
-	// lookup is added.
+// gcpResolver returns a SecretResolver that fetches issued certs from
+// GCP Secret Manager. Reads the issuer spec per call so spec.Endpoint
+// (VPC-SC / Private Google Access / non-GCP test target) is honoured
+// per-issuer. Per-call client construction is cheap and avoids a
+// (project × endpoint) cache key the bootstrap-once model would need.
+func gcpResolver(ctx context.Context, kube client.Client, _ string) controller.SecretResolver {
+	_ = ctx
 	return func(callCtx context.Context, cert *cmapi.Certificate) ([]byte, error) {
-		once.Do(bootstrap)
-		if initErr != nil {
-			return nil, initErr
+		ref, ok := controller.SecretName(cert)
+		if !ok {
+			return nil, fmt.Errorf("gcp: certificate %s/%s missing annotation %s", cert.Namespace, cert.Name, controller.AnnotationSecretName)
 		}
-		ref, _ := controller.SecretName(cert)
-		return gcp.Fetch(callCtx, smClient, normalizeGCPVersion(ref))
+		endpoint, err := gcpResolveConfig(callCtx, kube, cert)
+		if err != nil {
+			return nil, err
+		}
+		// ponytail: nil adcJSON → Workload Identity / ADC chain. Static
+		// ADC JSON is not exposed yet (spec.SecretRef unused for GCP);
+		// add when a user asks.
+		cli, err := gcp.New(callCtx, nil, endpoint)
+		if err != nil {
+			return nil, fmt.Errorf("gcp: new client: %w", err)
+		}
+		return gcp.Fetch(callCtx, cli, normalizeGCPVersion(ref))
+	}
+}
+
+// gcpResolveConfig looks up the GCP Issuer/ClusterIssuer and returns
+// spec.Endpoint.
+func gcpResolveConfig(ctx context.Context, kube client.Client, cert *cmapi.Certificate) (endpoint string, err error) {
+	ref := cert.Spec.IssuerRef
+	switch ref.Kind {
+	case "GCPSecretManagerIssuer":
+		var iss api.GCPSecretManagerIssuer
+		if err := kube.Get(ctx, types.NamespacedName{Name: ref.Name, Namespace: cert.Namespace}, &iss); err != nil {
+			return "", fmt.Errorf("gcp: get GCPSecretManagerIssuer %s/%s: %w", cert.Namespace, ref.Name, err)
+		}
+		return iss.Spec.Endpoint, nil
+	case "GCPSecretManagerClusterIssuer":
+		var iss api.GCPSecretManagerClusterIssuer
+		if err := kube.Get(ctx, types.NamespacedName{Name: ref.Name}, &iss); err != nil {
+			return "", fmt.Errorf("gcp: get GCPSecretManagerClusterIssuer %s: %w", ref.Name, err)
+		}
+		return iss.Spec.Endpoint, nil
+	default:
+		return "", fmt.Errorf("gcp: unexpected issuer kind %q", ref.Kind)
 	}
 }
 
@@ -308,17 +347,18 @@ func tencentResolver(ctx context.Context, kube client.Client, cmNamespace string
 	var mu sync.Mutex
 	cache := map[string]*tcssm.Client{}
 	_ = ctx
-	clientFor := func(callCtx context.Context, region string, cred tccommon.CredentialIface) (*tcssm.Client, error) {
+	clientFor := func(callCtx context.Context, region, endpoint string, cred tccommon.CredentialIface) (*tcssm.Client, error) {
+		key := region + "|" + endpoint
 		mu.Lock()
 		defer mu.Unlock()
-		if c, ok := cache[region]; ok {
+		if c, ok := cache[key]; ok {
 			return c, nil
 		}
-		c, err := tencent.New(callCtx, region, cred, "")
+		c, err := tencent.New(callCtx, region, cred, endpoint)
 		if err != nil {
 			return nil, err
 		}
-		cache[region] = c
+		cache[key] = c
 		return c, nil
 	}
 	return func(callCtx context.Context, cert *cmapi.Certificate) ([]byte, error) {
@@ -326,11 +366,11 @@ func tencentResolver(ctx context.Context, kube client.Client, cmNamespace string
 		if !ok {
 			return nil, fmt.Errorf("tencent: certificate %s/%s missing annotation %s", cert.Namespace, cert.Name, controller.AnnotationSecretName)
 		}
-		region, cred, err := tencentResolveConfig(callCtx, kube, cert, cmNamespace)
+		region, endpoint, cred, err := tencentResolveConfig(callCtx, kube, cert, cmNamespace)
 		if err != nil {
 			return nil, err
 		}
-		c, err := clientFor(callCtx, region, cred)
+		c, err := clientFor(callCtx, region, endpoint, cred)
 		if err != nil {
 			return nil, err
 		}
@@ -343,28 +383,28 @@ func tencentResolver(ctx context.Context, kube client.Client, cmNamespace string
 // (when env is bound) → static AK/SK from spec.secretRef. Endpoint is
 // empty → SDK defaults to public. Empty spec.SecretRef.Namespace falls
 // back to cert.Namespace (Issuer) or cmNamespace (ClusterIssuer).
-func tencentResolveConfig(ctx context.Context, kube client.Client, cert *cmapi.Certificate, cmNamespace string) (region string, cred tccommon.CredentialIface, err error) {
+func tencentResolveConfig(ctx context.Context, kube client.Client, cert *cmapi.Certificate, cmNamespace string) (region, endpoint string, cred tccommon.CredentialIface, err error) {
 	ref := cert.Spec.IssuerRef
-	var region2 string
+	var region2, endpoint2 string
 	var sref *api.SecretRef
 	switch ref.Kind {
 	case "TencentSecretManagerIssuer":
 		var iss api.TencentSecretManagerIssuer
 		if err := kube.Get(ctx, types.NamespacedName{Name: ref.Name, Namespace: cert.Namespace}, &iss); err != nil {
-			return "", nil, fmt.Errorf("tencent: get TencentSecretManagerIssuer %s/%s: %w", cert.Namespace, ref.Name, err)
+			return "", "", nil, fmt.Errorf("tencent: get TencentSecretManagerIssuer %s/%s: %w", cert.Namespace, ref.Name, err)
 		}
-		region2, sref = iss.Spec.Region, iss.Spec.SecretRef
+		region2, endpoint2, sref = iss.Spec.Region, iss.Spec.Endpoint, iss.Spec.SecretRef
 	case "TencentSecretManagerClusterIssuer":
 		var iss api.TencentSecretManagerClusterIssuer
 		if err := kube.Get(ctx, types.NamespacedName{Name: ref.Name}, &iss); err != nil {
-			return "", nil, fmt.Errorf("tencent: get TencentSecretManagerClusterIssuer %s: %w", ref.Name, err)
+			return "", "", nil, fmt.Errorf("tencent: get TencentSecretManagerClusterIssuer %s: %w", ref.Name, err)
 		}
-		region2, sref = iss.Spec.Region, iss.Spec.SecretRef
+		region2, endpoint2, sref = iss.Spec.Region, iss.Spec.Endpoint, iss.Spec.SecretRef
 	default:
-		return "", nil, fmt.Errorf("tencent: unexpected issuer kind %q", ref.Kind)
+		return "", "", nil, fmt.Errorf("tencent: unexpected issuer kind %q", ref.Kind)
 	}
 	if region2 == "" {
-		return "", nil, fmt.Errorf("tencent: issuer %s/%s missing spec.region", ref.Kind, ref.Name)
+		return "", "", nil, fmt.Errorf("tencent: issuer %s/%s missing spec.region", ref.Kind, ref.Name)
 	}
 	// TKE OIDC wins when the pod is on TKE; secretRef becomes optional.
 	credName, credNS := "", ""
@@ -382,9 +422,9 @@ func tencentResolveConfig(ctx context.Context, kube client.Client, cert *cmapi.C
 	}
 	cred, err = tencent.ResolveCredential(ctx, kube, credName, credNS)
 	if err != nil {
-		return "", nil, err
+		return "", "", nil, err
 	}
-	return region2, cred, nil
+	return region2, endpoint2, cred, nil
 }
 
 // normalizeGCPVersion appends /versions/latest to a GCP Secret Manager

@@ -55,6 +55,7 @@ metadata:
 spec:
   region: us-east-1
   # secretRef optional — omit to use IRSA pod identity
+  # endpoint: https://vpce-xxx.secretsmanager.us-east-1.vpce.amazonaws.com  # optional VPC endpoint
 ---
 apiVersion: cert-manager.io/v1
 kind: Certificate

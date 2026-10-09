@@ -125,7 +125,7 @@ func TestAwsResolveConfig(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			region, credName, credNS, err := awsResolveConfig(context.Background(), cli, tc.cert, cmNS)
+			region, credName, credNS, _, err := awsResolveConfig(context.Background(), cli, tc.cert, cmNS)
 			if tc.wantErrSub != "" {
 				if err == nil {
 					t.Fatalf("expected error containing %q, got nil", tc.wantErrSub)
