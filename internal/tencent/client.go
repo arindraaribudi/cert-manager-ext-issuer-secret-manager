@@ -45,8 +45,11 @@ func New(ctx context.Context, region string, cred tccommon.CredentialIface, endp
 func Fetch(ctx context.Context, c *tcssm.Client, secretName string) ([]byte, error) {
 	req := tcssm.NewGetSecretValueRequest()
 	req.SecretName = &secretName
-	// VersionId is required by the intl-en SDK; default to the latest stage.
-	versionID := "$LATEST"
+	// VersionId is required by the intl-en SDK; the API rejects anything
+	// outside [a-zA-Z0-9][a-zA-Z0-9\-_.]{0,63} with InvalidParameterValue,
+	// so '$' is out. SSM_Current is the SDK-documented sentinel for the
+	// currently-in-use version. Empty defaults to v1 (initial) — wrong here.
+	versionID := "SSM_Current"
 	req.VersionId = &versionID
 	resp, err := c.GetSecretValueWithContext(ctx, req)
 	if err != nil {
