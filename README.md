@@ -32,7 +32,7 @@ For per-file layout during development: `kubectl apply -f config/crd/bases/ -f c
 make codegen   # controller-gen: CRDs + deep-copy
 make build     # ./bin/manager
 make test      # go test ./...
-make lint      # golangci-lint v2.13.2+
+make lint      # golangci-lint v2.14.0+ (source-build via `make tools`)
 make audit     # govulncheck
 make scan      # trivy HIGH,CRITICAL on built image
 
@@ -40,8 +40,10 @@ make scan      # trivy HIGH,CRITICAL on built image
 go build -o bin/jks2secret ./cmd/jks2secret
 ```
 
-Requires Go **1.27** and `golangci-lint` **v2.13.2+** (older builds can't
-decode Go 1.27's export format).
+Requires Go **1.27.2** and `golangci-lint` **v2.14.0** source-built
+against that toolchain (`make tools` handles it). Released binaries
+of v2.14.0 are built with go1.27.1 and can't decode Go 1.27.2's
+export format.
 
 ## Sample (AWS)
 
