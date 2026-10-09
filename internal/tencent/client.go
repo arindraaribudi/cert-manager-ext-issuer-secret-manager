@@ -41,18 +41,20 @@ func New(ctx context.Context, region string, cred tccommon.CredentialIface, endp
 	return tcssm.NewClient(cred, region, prof)
 }
 
-// Fetch reads the latest version of secretName and returns its plaintext
-// SecretString. Errors when the secret is binary-only (no SecretString),
-// missing, or the API call fails.
+// Fetch reads the currently-staged version of secretName and returns its
+// plaintext SecretString. Works for v1, v6, anything in between. Errors
+// when the secret is binary-only (no SecretString), missing, or the API
+// call fails. ponytail: the intl-en partition rejects the "SSM_Current"
+// sentinel string in VersionId, so we resolve the numeric id via
+// ListSecretVersionIds first — works on every version (1, 6, …).
 func Fetch(ctx context.Context, c *tcssm.Client, secretName string) ([]byte, error) {
+	vid, err := currentVersion(ctx, c, secretName)
+	if err != nil {
+		return nil, fmt.Errorf("tencent: resolve current version of %q: %w", secretName, err)
+	}
 	req := tcssm.NewGetSecretValueRequest()
 	req.SecretName = &secretName
-	// VersionId is required by the intl-en SDK; the API rejects anything
-	// outside [a-zA-Z0-9][a-zA-Z0-9\-_.]{0,63} with InvalidParameterValue,
-	// so '$' is out. SSM_Current is the SDK-documented sentinel for the
-	// currently-in-use version. Empty defaults to v1 (initial) — wrong here.
-	versionID := "SSM_Current"
-	req.VersionId = &versionID
+	req.VersionId = &vid
 	resp, err := c.GetSecretValueWithContext(ctx, req)
 	if err != nil {
 		return nil, fmt.Errorf("tencent: get secret %q: %w", secretName, err)
@@ -64,6 +66,41 @@ func Fetch(ctx context.Context, c *tcssm.Client, secretName string) ([]byte, err
 		return nil, fmt.Errorf("tencent: secret %q is binary-only (no SecretString); payloadKeys extract not applicable", secretName)
 	}
 	return []byte(*resp.Response.SecretString), nil
+}
+
+// currentVersion returns the highest numeric VersionId for secretName
+// (TC SSM versions are monotonic integers; latest = largest). The intl-en
+// SDK's VersionInfo exposes only VersionId+CreateTime (no VersionStages),
+// so the SSM_Current/SSM_Previous stage labels aren't reachable here.
+// Errors when the secret has no versions or no numeric id.
+// ponytail: global ceiling — one ListSecretVersionIds call per Fetch.
+// Add a short-TTL cache in tencentResolver when rotation traffic matters.
+func currentVersion(ctx context.Context, c *tcssm.Client, secretName string) (string, error) {
+	req := tcssm.NewListSecretVersionIdsRequest()
+	req.SecretName = &secretName
+	resp, err := c.ListSecretVersionIdsWithContext(ctx, req)
+	if err != nil {
+		return "", err
+	}
+	if resp.Response == nil || len(resp.Response.Versions) == 0 {
+		return "", fmt.Errorf("no versions")
+	}
+	var best string
+	var bestN int64
+	for _, v := range resp.Response.Versions {
+		if v.VersionId == nil {
+			continue
+		}
+		var n int64
+		if _, err := fmt.Sscanf(*v.VersionId, "%d", &n); err == nil && n > bestN {
+			bestN = n
+			best = *v.VersionId
+		}
+	}
+	if best == "" {
+		return "", fmt.Errorf("no usable version id")
+	}
+	return best, nil
 }
 
 // IsTkePodIdentity reports whether the pod has TKE OIDC env vars bound
