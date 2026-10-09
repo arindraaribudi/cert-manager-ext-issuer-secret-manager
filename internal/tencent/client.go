@@ -45,6 +45,9 @@ func New(ctx context.Context, region string, cred tccommon.CredentialIface, endp
 func Fetch(ctx context.Context, c *tcssm.Client, secretName string) ([]byte, error) {
 	req := tcssm.NewGetSecretValueRequest()
 	req.SecretName = &secretName
+	// VersionId is required by the intl-en SDK; default to the latest stage.
+	versionID := "$LATEST"
+	req.VersionId = &versionID
 	resp, err := c.GetSecretValueWithContext(ctx, req)
 	if err != nil {
 		return nil, fmt.Errorf("tencent: get secret %q: %w", secretName, err)
