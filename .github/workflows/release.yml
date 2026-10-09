@@ -85,11 +85,11 @@ jobs:
         id: cache-golangci-lint
         with:
           path: ~/go/bin/golangci-lint
-          key: golangci-lint-v2.13.2-${{ runner.os }}
+          key: golangci-lint-v2.14.0-${{ runner.os }}
 
       - name: install golangci-lint
         if: steps.cache-golangci-lint.outputs.cache-hit != 'true'
-        run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.2
+        run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.14.0
 
       - uses: actions/cache@v5
         with:

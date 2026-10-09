@@ -1,7 +1,7 @@
 .PHONY: codegen manifests generate lint test build docker-build docker-buildx trivy scan audit ci bundle tools
 
 GO_VERSION          ?= 1.27.2
-GOLANGCI_LINT_VERSION ?= v2.13.2
+GOLANGCI_LINT_VERSION ?= v2.14.0
 CONTROLLER_GEN_VERSION ?= v0.18.0
 TRIVY_VERSION        ?= v0.74.0
 GOVULNCHECK_VERSION  ?= v1.1.4
