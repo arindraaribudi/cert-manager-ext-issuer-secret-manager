@@ -31,12 +31,11 @@ import (
 // RequeueAfterError lives in log.go (shared across reconcilers).
 
 // SecretResolver fetches and returns the raw JSON payload bytes from the
-// configured cloud provider, given a spec + secret-manager-side ref.
-// Each cloud package's fake + real client implements this signature via a
-// thin adapter. Today the real AWS/GCP/Tencent clients don't yet satisfy
-// this shape (T9/T10 return raw bytes; T11 stub) — that's OK, the wiring
-// in app.go will adapt them. The reconciler only depends on this interface.
-type SecretResolver func(ctx context.Context, ref string) ([]byte, error)
+// configured cloud provider. The closure receives the Certificate so it
+// can look up the Issuer spec (region, SecretRef, endpoint) and the
+// source ref via the secret-manager annotation. Each cloud package's
+// adapter in internal/app/app.go owns the lookup + cache.
+type SecretResolver func(ctx context.Context, cert *cmapi.Certificate) ([]byte, error)
 
 // IssuerReconciler reconciles Certificate resources by fetching TLS material
 // from the configured cloud provider.
@@ -85,7 +84,7 @@ func (r *IssuerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	}
 	_ = kind
 
-	payload, err := resolver(ctx, ref)
+	payload, err := resolver(ctx, &cert)
 	if err != nil {
 		_ = MarkCertDrift(ctx, r.Client, &cert, "SourceMissing", err.Error())
 		return RequeueAfterError(ctx, err, "secret-manager: fetch payload",

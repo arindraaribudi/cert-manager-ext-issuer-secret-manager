@@ -40,6 +40,9 @@ import (
 	tccommon "github.com/tencentcloud/tencentcloud-sdk-go-intl-en/tencentcloud/common"
 	tcprofile "github.com/tencentcloud/tencentcloud-sdk-go-intl-en/tencentcloud/common/profile"
 	tcssl "github.com/tencentcloud/tencentcloud-sdk-go-intl-en/tencentcloud/ssl/v20191205"
+	tcssm "github.com/tencentcloud/tencentcloud-sdk-go-intl-en/tencentcloud/ssm/v20190923"
+
+	"github.com/arindraaribudi/cert-manager-ext-issuer-secret-manager/internal/tencent"
 )
 
 // ourIssuerFilter drops every Certificate event whose IssuerRef.Group isn't
@@ -92,10 +95,8 @@ func BuildIssuerResolvers(ctx context.Context, kube client.Client, cmNamespace s
 	resolvers["GCPSecretManagerIssuer"] = gcpResolver(ctx)
 	resolvers["GCPSecretManagerClusterIssuer"] = resolvers["GCPSecretManagerIssuer"]
 
-	// Tencent — stub returns AuthFailed today (per plan §10 follow-up).
-	resolvers["TencentSecretManagerIssuer"] = func(ctx context.Context, ref string) ([]byte, error) {
-		return nil, fmt.Errorf("tencent: real SDK wiring not yet implemented (cert id %q)", ref)
-	}
+	// Tencent — real SSM client, cached per (region, creds, endpoint).
+	resolvers["TencentSecretManagerIssuer"] = tencentResolver(ctx, kube, cmNamespace)
 	resolvers["TencentSecretManagerClusterIssuer"] = resolvers["TencentSecretManagerIssuer"]
 
 	cfgFn := func(ctx context.Context, cert *cmapi.Certificate) (api.IssuerConfig, error) {
@@ -177,20 +178,13 @@ func Run(ctx context.Context, opts Options) error {
 // ponytail: simple + correct; the extra Get on each reconcile is a small cost
 // vs. caching per-cert which adds complexity.
 func awsResolver(ctx context.Context) controller.SecretResolver {
-	return func(callCtx context.Context, ref string) ([]byte, error) {
-		// Look up the cert via the controller-runtime client passed through ctx? No — use the
-		// simpler signature: callers MUST go through the reconciler, which loads the Issuer
-		// first. Here we accept that the region is encoded in the ref prefixed: NOT — instead
-		// the app builds resolvers per Issuer kind and per-cert, reading the region from the
-		// Issuer spec. That's the right place to do caching.
-		//
-		// For simplicity in v1: we look up the Issuer via the global cached client list
-		// keyed by region string (passed via ref convention "<region>/<name>"). TODO: replace
-		// with a richer SecretResolver signature that takes the IssuerSpec. For now, return
-		// an error telling users to set PayloadKeys + wait for T15.5.
+	return func(callCtx context.Context, cert *cmapi.Certificate) ([]byte, error) {
+		// AWS Secrets Manager resolver wiring is deferred (plan §10 self-review).
+		// Same richer signature as tencentResolver — region/creds live on the
+		// Issuer spec which the closure now has access to via `cert`.
 		_ = ctx
 		_ = callCtx
-		_ = ref
+		_ = cert
 		return nil, fmt.Errorf("aws: per-cert SecretResolver wiring deferred — see plan §10 self-review")
 	}
 }
@@ -209,13 +203,106 @@ func gcpResolver(ctx context.Context) controller.SecretResolver {
 		}
 		smClient = cli
 	}
-	return func(callCtx context.Context, ref string) ([]byte, error) {
+	// ponytail: gcpResolver uses project from the Issuer spec — same richer
+	// signature gives it access; wire per-region cache here once the project
+	// lookup is added.
+	return func(callCtx context.Context, cert *cmapi.Certificate) ([]byte, error) {
 		once.Do(bootstrap)
 		if initErr != nil {
 			return nil, initErr
 		}
+		ref, _ := controller.SecretName(cert)
 		return gcp.Fetch(callCtx, smClient, normalizeGCPVersion(ref))
 	}
+}
+
+// tencentResolver returns a SecretResolver that fetches issued certs from
+// Tencent SSM. SDK clients are cached per region — the OIDC provider
+// handles STS token refresh internally, so caching by region (not creds)
+// keeps a single client per region across all certs. Closure captures
+// the kube client + cert-manager namespace fallback for empty
+// spec.SecretRef.Namespace on ClusterIssuer kinds.
+func tencentResolver(ctx context.Context, kube client.Client, cmNamespace string) controller.SecretResolver {
+	var mu sync.Mutex
+	cache := map[string]*tcssm.Client{}
+	_ = ctx
+	clientFor := func(callCtx context.Context, region string, cred tccommon.CredentialIface) (*tcssm.Client, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		if c, ok := cache[region]; ok {
+			return c, nil
+		}
+		c, err := tencent.New(callCtx, region, cred, "")
+		if err != nil {
+			return nil, err
+		}
+		cache[region] = c
+		return c, nil
+	}
+	return func(callCtx context.Context, cert *cmapi.Certificate) ([]byte, error) {
+		ref, ok := controller.SecretName(cert)
+		if !ok {
+			return nil, fmt.Errorf("tencent: certificate %s/%s missing annotation %s", cert.Namespace, cert.Name, controller.AnnotationSecretName)
+		}
+		region, cred, err := tencentResolveConfig(callCtx, kube, cert, cmNamespace)
+		if err != nil {
+			return nil, err
+		}
+		c, err := clientFor(callCtx, region, cred)
+		if err != nil {
+			return nil, err
+		}
+		return tencent.Fetch(callCtx, c, ref)
+	}
+}
+
+// tencentResolveConfig looks up the Issuer/ClusterIssuer for cert, returns
+// (region, credential). Credential resolution: TKE OIDC pod identity
+// (when env is bound) → static AK/SK from spec.secretRef. Endpoint is
+// empty → SDK defaults to public. Empty spec.SecretRef.Namespace falls
+// back to cert.Namespace (Issuer) or cmNamespace (ClusterIssuer).
+func tencentResolveConfig(ctx context.Context, kube client.Client, cert *cmapi.Certificate, cmNamespace string) (region string, cred tccommon.CredentialIface, err error) {
+	ref := cert.Spec.IssuerRef
+	var region2 string
+	var sref *api.SecretRef
+	switch ref.Kind {
+	case "TencentSecretManagerIssuer":
+		var iss api.TencentSecretManagerIssuer
+		if err := kube.Get(ctx, types.NamespacedName{Name: ref.Name, Namespace: cert.Namespace}, &iss); err != nil {
+			return "", nil, fmt.Errorf("tencent: get TencentSecretManagerIssuer %s/%s: %w", cert.Namespace, ref.Name, err)
+		}
+		region2, sref = iss.Spec.Region, iss.Spec.SecretRef
+	case "TencentSecretManagerClusterIssuer":
+		var iss api.TencentSecretManagerClusterIssuer
+		if err := kube.Get(ctx, types.NamespacedName{Name: ref.Name}, &iss); err != nil {
+			return "", nil, fmt.Errorf("tencent: get TencentSecretManagerClusterIssuer %s: %w", ref.Name, err)
+		}
+		region2, sref = iss.Spec.Region, iss.Spec.SecretRef
+	default:
+		return "", nil, fmt.Errorf("tencent: unexpected issuer kind %q", ref.Kind)
+	}
+	if region2 == "" {
+		return "", nil, fmt.Errorf("tencent: issuer %s/%s missing spec.region", ref.Kind, ref.Name)
+	}
+	// TKE OIDC wins when the pod is on TKE; secretRef becomes optional.
+	credName, credNS := "", ""
+	if sref != nil {
+		credName = sref.Name
+		credNS = sref.Namespace
+		if credNS == "" {
+			switch ref.Kind {
+			case "TencentSecretManagerIssuer":
+				credNS = cert.Namespace
+			case "TencentSecretManagerClusterIssuer":
+				credNS = cmNamespace
+			}
+		}
+	}
+	cred, err = tencent.ResolveCredential(ctx, kube, credName, credNS)
+	if err != nil {
+		return "", nil, err
+	}
+	return region2, cred, nil
 }
 
 // normalizeGCPVersion appends /versions/latest to a GCP Secret Manager

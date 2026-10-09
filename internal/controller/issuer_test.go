@@ -29,6 +29,17 @@ import (
 	cmmeta "github.com/cert-manager/cert-manager/pkg/apis/meta/v1"
 )
 
+// mustRef returns the source-ref annotation on cert, failing the test when
+// missing. Keeps per-provider SecretResolver test bodies tiny.
+func mustRef(t *testing.T, cert *cmapi.Certificate) string {
+	t.Helper()
+	r, ok := SecretName(cert)
+	if !ok {
+		t.Fatalf("test cert missing annotation %s", AnnotationSecretName)
+	}
+	return r
+}
+
 // newTestReconciler wires a fake-client-backed IssuerReconciler with a
 // minimal scheme. Status subresource is enabled for Certificate so
 // Status().Update round-trips through the fake client.
@@ -133,7 +144,7 @@ func TestReconcile_SourceMissing(t *testing.T) {
 	}
 	r := newTestReconciler(t, cert)
 	r.ProviderResolvers = map[string]SecretResolver{
-		"AWSIssuer": func(ctx context.Context, ref string) ([]byte, error) {
+		"AWSIssuer": func(ctx context.Context, cert *cmapi.Certificate) ([]byte, error) {
 			return nil, errors.New("cloud unreachable")
 		},
 	}
@@ -178,7 +189,8 @@ func TestReconcile_HappyPath(t *testing.T) {
 	}
 	r := newTestReconciler(t, cert)
 	r.ProviderResolvers = map[string]SecretResolver{
-		"AWSIssuer": func(ctx context.Context, ref string) ([]byte, error) {
+		"AWSIssuer": func(ctx context.Context, cert *cmapi.Certificate) ([]byte, error) {
+			ref := mustRef(t, cert)
 			if ref != "cloud/secret" {
 				t.Fatalf("ref = %q, want cloud/secret", ref)
 			}
@@ -267,7 +279,7 @@ func TestReconcile_ClusterIssuerFanOut(t *testing.T) {
 
 	r := newTestReconciler(t, cert, nsCert, nsA, nsB, nsTerm)
 	r.ProviderResolvers = map[string]SecretResolver{
-		"AWSSecretManagerClusterIssuer": func(ctx context.Context, ref string) ([]byte, error) {
+		"AWSSecretManagerClusterIssuer": func(ctx context.Context, cert *cmapi.Certificate) ([]byte, error) {
 			return payload, nil
 		},
 	}
@@ -340,7 +352,7 @@ func TestReconcile_ClusterIssuerFanOut_NamespaceFilter(t *testing.T) {
 
 	r := newTestReconciler(t, cert, nsCert, nsA, nsB)
 	r.ProviderResolvers = map[string]SecretResolver{
-		"AWSSecretManagerClusterIssuer": func(ctx context.Context, ref string) ([]byte, error) {
+		"AWSSecretManagerClusterIssuer": func(ctx context.Context, cert *cmapi.Certificate) ([]byte, error) {
 			return payload, nil
 		},
 	}
@@ -416,7 +428,7 @@ func TestReconcile_FanOutContinuesAfterOneNamespaceFails(t *testing.T) {
 		Build()
 	r := &IssuerReconciler{Client: cli, Scheme: scheme}
 	r.ProviderResolvers = map[string]SecretResolver{
-		"AWSSecretManagerClusterIssuer": func(ctx context.Context, ref string) ([]byte, error) {
+		"AWSSecretManagerClusterIssuer": func(ctx context.Context, cert *cmapi.Certificate) ([]byte, error) {
 			return payload, nil
 		},
 	}
@@ -475,7 +487,7 @@ func TestReconcile_GeneratesKeystores(t *testing.T) {
 	}
 	r := newTestReconciler(t, cert)
 	r.ProviderResolvers = map[string]SecretResolver{
-		"AWSIssuer": func(ctx context.Context, ref string) ([]byte, error) {
+		"AWSIssuer": func(ctx context.Context, cert *cmapi.Certificate) ([]byte, error) {
 			return payload, nil
 		},
 	}
@@ -543,7 +555,7 @@ func TestReconcile_EndToEnd_CompletesChainWithKnownRoot(t *testing.T) {
 	}
 	r := newTestReconciler(t, cert)
 	r.ProviderResolvers = map[string]SecretResolver{
-		"AWSIssuer": func(ctx context.Context, ref string) ([]byte, error) {
+		"AWSIssuer": func(ctx context.Context, cert *cmapi.Certificate) ([]byte, error) {
 			return payload, nil
 		},
 	}
@@ -609,7 +621,7 @@ func TestReconcile_EndToEnd_SamplePEMProducesValidSecret(t *testing.T) {
 	}
 	r := newTestReconciler(t, cert)
 	r.ProviderResolvers = map[string]SecretResolver{
-		"AWSIssuer": func(ctx context.Context, ref string) ([]byte, error) {
+		"AWSIssuer": func(ctx context.Context, cert *cmapi.Certificate) ([]byte, error) {
 			return payload, nil
 		},
 	}

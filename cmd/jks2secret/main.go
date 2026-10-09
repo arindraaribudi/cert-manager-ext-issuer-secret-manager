@@ -159,7 +159,9 @@ func Main() int {
 		}
 		log.Printf("wrote %s (%d bytes)", *out, len(doc))
 	} else {
-		os.Stdout.Write(doc)
+		if _, err := os.Stdout.Write(doc); err != nil {
+			log.Fatalf("write stdout: %v", err)
+		}
 	}
 
 	if *skipVerify {
