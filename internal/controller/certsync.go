@@ -151,36 +151,14 @@ func (r *CertSyncer) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	// whatever CompleteChain added — otherwise the JKS/PKCS12 silently miss
 	// the root that tls.crt just gained.
 	keystoreLeaf, keystoreChain := keystore.SplitLeafAndChain(tlsCrt)
-	// Chain-only source: every cert in tlsCrt is a trust anchor, including
-	// the "leaf" position. Use the whole bundle for ca.crt + truststore so
-	// a single-cert chain still ships both keys (SplitLeafAndChain on a
-	// one-cert bundle would leave an empty chain and drop both).
-	chainForTrust := keystoreChain
-	if len(result.LeafPEM) == 0 {
-		chainForTrust = tlsCrt
-	}
-	jks, p12, pw, truststore, skipped, err := BuildKeystore(keystoreLeaf, result.KeyPEM, chainForTrust,
+	jks, p12, pw, skipped, err := BuildKeystore(keystoreLeaf, result.KeyPEM, keystoreChain,
 		keystoreExisting, secret.Annotations[AnnotationSourceHash])
 	if err != nil {
 		_ = MarkCertDrift(ctx, r.Client, &cert, "KeystoreBuildFailed", err.Error())
 		// fall through — TLS half still ships; keystore drift visible on next reconcile.
-	} else if skipped && len(truststore) == 0 {
-		// Neither key nor chain — nothing useful to put in any keystore.
-		_ = MarkCertDrift(ctx, r.Client, &cert, "KeystoreSkipped", r.Source.Prefix()+": source lacks private key and chain; no keystore output")
+	} else if skipped {
+		_ = MarkCertDrift(ctx, r.Client, &cert, "KeystoreSkipped", r.Source.Prefix()+": source lacks private key; JKS/PKCS12 not generated")
 	} else {
-		// Either we built jks/p12 (key present) or truststore (chain present,
-		// key absent) — both branches land here. Mark TruststoreOnly
-		// informatively when the key was absent so operators see the mode
-		// in the Secret's drift annotations during reconcile (cleared below).
-		if skipped {
-			_ = MarkCertDrift(ctx, r.Client, &cert, "TruststoreOnly", r.Source.Prefix()+": source lacks private key; producing truststore.jks + ca.crt")
-		}
-		if len(truststore) > 0 {
-			secret.Data["truststore.jks"] = truststore
-		}
-		if len(chainForTrust) > 0 {
-			secret.Data[corev1.ServiceAccountRootCAKey] = chainForTrust
-		}
 		secret.Data["keystore.jks"] = jks
 		secret.Data["keystore.p12"] = p12
 		secret.Data["keystore.password"] = pw

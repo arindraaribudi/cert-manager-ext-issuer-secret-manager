@@ -83,21 +83,6 @@ func TestExtract(t *testing.T) {
 			wantErr: true,
 		},
 		{
-			// Chain-only source: leaf is derived from chain[0], rest stays
-			// as chain. Enables truststore-only mode (ca.crt + truststore.jks)
-			// when the upstream secret has no separate leaf/key fields.
-			name:    "chain only derives leaf and chain",
-			json:    `{"certificate_chain":"` + jsonEscape(string(cert)+string(chain)) + `"}`,
-			keys:    v1alpha1.PayloadKeys{},
-			want:    &extracted{Certificate: cert, PrivateKey: nil, Chain: chain},
-		},
-		{
-			name:    "no fields at all",
-			json:    `{}`,
-			keys:    v1alpha1.PayloadKeys{},
-			wantErr: true,
-		},
-		{
 			name:    "invalid json",
 			json:    `not json`,
 			keys:    v1alpha1.PayloadKeys{},

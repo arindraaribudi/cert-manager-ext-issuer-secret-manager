@@ -14,10 +14,9 @@ import (
 // which is signed by the second, and so on — a valid signing path from
 // leaf to the end of the supplied chain. No system/root trust store is
 // consulted; private/internal CAs are expected. No-op when chainPEM is
-// empty — chain is optional upstream — or when leafPEM is empty
-// (chain-only sources; no anchor to walk the path from).
+// empty — chain is optional upstream.
 func VerifyChain(leafPEM, chainPEM []byte) error {
-	if len(chainPEM) == 0 || len(leafPEM) == 0 {
+	if len(chainPEM) == 0 {
 		return nil
 	}
 	leaf, err := parseLeadingCert(leafPEM)

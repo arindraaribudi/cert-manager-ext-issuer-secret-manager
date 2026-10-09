@@ -8,7 +8,6 @@ import (
 	"fmt"
 
 	api "github.com/arindraaribudi/cert-manager-ext-issuer-secret-manager/api/v1alpha1"
-	"github.com/arindraaribudi/cert-manager-ext-issuer-secret-manager/internal/keystore"
 	"github.com/arindraaribudi/cert-manager-ext-issuer-secret-manager/internal/provider"
 )
 
@@ -17,10 +16,8 @@ import (
 type extracted = provider.Certificate
 
 // Extract parses a JSON byte payload using the configured key names and
-// returns the three PEM fields. Chain-only payloads (only certificate_chain
-// set) are valid: the leaf is derived from chain[0] and the rest stays as
-// the chain. An error names the missing field so callers can set
-// Ready=False/InvalidPayload.
+// returns the three PEM fields. Returns an error naming the missing field
+// so callers can set Ready=False/InvalidPayload.
 func Extract(payload []byte, keys api.PayloadKeys) (*extracted, error) {
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(payload, &raw); err != nil {
@@ -31,34 +28,19 @@ func Extract(payload []byte, keys api.PayloadKeys) (*extracted, error) {
 	keyKey := keys.PrivateKeyOrDefault()
 	chainKey := keys.CertificateChainOrDefault()
 
-	certPEM := pemField(raw[certKey])
-	keyPEM := pemField(raw[keyKey])
-	chainPEM := pemField(raw[chainKey])
-
-	if len(certPEM) == 0 && len(chainPEM) == 0 {
-		return nil, fmt.Errorf("missing field %q (or %q)", certKey, chainKey)
+	certRaw, ok := raw[certKey]
+	if !ok || len(certRaw) == 0 || string(certRaw) == `""` {
+		return nil, fmt.Errorf("missing field %q", certKey)
 	}
-	if len(keyPEM) == 0 && len(chainPEM) == 0 {
-		return nil, fmt.Errorf("missing field %q (or %q)", keyKey, chainKey)
+	keyRaw, ok := raw[keyKey]
+	if !ok || len(keyRaw) == 0 || string(keyRaw) == `""` {
+		return nil, fmt.Errorf("missing field %q", keyKey)
 	}
-	// Chain-only source: derive leaf from chain[0], remainder stays as chain
-	// so downstream splits (tls.crt, ca.crt, truststore.jks) work uniformly.
-	if len(certPEM) == 0 {
-		leaf, rest := keystore.SplitLeafAndChain(chainPEM)
-		certPEM = leaf
-		chainPEM = rest
+	out := &extracted{Certificate: NormalizePEM(mustUnquote(certRaw)), PrivateKey: NormalizePEM(mustUnquote(keyRaw))}
+	if chainRaw, ok := raw[chainKey]; ok && len(chainRaw) > 0 && string(chainRaw) != `""` {
+		out.Chain = NormalizePEM(mustUnquote(chainRaw))
 	}
-	return &extracted{Certificate: certPEM, PrivateKey: keyPEM, Chain: chainPEM}, nil
-}
-
-// pemField returns the PEM bytes for a JSON field, applying the same
-// unwrap-and-normalize steps Extract always used. Missing / empty / `""`
-// all collapse to nil.
-func pemField(raw json.RawMessage) []byte {
-	if len(raw) == 0 || string(raw) == `""` {
-		return nil
-	}
-	return NormalizePEM(mustUnquote(raw))
+	return out, nil
 }
 
 func mustUnquote(raw json.RawMessage) []byte {
