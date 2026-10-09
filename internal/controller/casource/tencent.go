@@ -20,8 +20,6 @@ import (
 	api "github.com/arindraaribudi/cert-manager-ext-issuer-secret-manager/api/v1alpha1"
 )
 
-const tencentPrefix = "tencent"
-
 // TencentReconciler reconciles TencentSecretManagerCASource.
 type TencentReconciler struct {
 	*Reconciler

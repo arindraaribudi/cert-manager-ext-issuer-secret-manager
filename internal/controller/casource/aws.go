@@ -21,8 +21,6 @@ import (
 	api "github.com/arindraaribudi/cert-manager-ext-issuer-secret-manager/api/v1alpha1"
 )
 
-const awsPrefix = "aws"
-
 // AWSReconciler reconciles AWSSecretManagerCASource.
 type AWSReconciler struct {
 	*Reconciler

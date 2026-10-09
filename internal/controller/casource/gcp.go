@@ -18,8 +18,6 @@ import (
 	api "github.com/arindraaribudi/cert-manager-ext-issuer-secret-manager/api/v1alpha1"
 )
 
-const gcpPrefix = "gcp"
-
 // GCPReconciler reconciles GCPSecretManagerCASource.
 type GCPReconciler struct {
 	*Reconciler
