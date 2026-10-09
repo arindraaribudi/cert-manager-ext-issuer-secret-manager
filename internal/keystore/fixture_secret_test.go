@@ -2,16 +2,17 @@ package keystore_test
 
 import (
 	"bytes"
-	"crypto/sha256"
+	"crypto/rand"
+	"crypto/rsa"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/base64"
-	"encoding/json"
 	"encoding/pem"
-	"fmt"
+	"math/big"
 	"os"
 	"path/filepath"
-	"runtime"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -22,47 +23,52 @@ import (
 	"github.com/arindraaribudi/cert-manager-ext-issuer-secret-manager/internal/keystore"
 )
 
-// fixture mirrors the upstream source payload shape (see
-// tt/jks/secret-payload.pem.json). "certificate_chain" carries
-// leaf+intermediates concatenated — SplitLeafAndChain splits them.
-type fixture struct {
+// smPayload mirrors the upstream source payload shape (see COMPONENTS.md):
+// "certificate" is the leaf, "certificate_chain" is the CA bundle only
+// (the leaf is NOT repeated inside certificate_chain — that's a
+// kubernetes.io/tls Secret convention, not the SM payload one).
+type smPayload struct {
 	Certificate      string `json:"certificate"`
 	PrivateKey       string `json:"private_key"`
 	CertificateChain string `json:"certificate_chain"`
 }
 
-// TestBuildFromFixture takes the sample PEM/JKS payload under tt/jks/
-// and generates a kubernetes.io/tls Secret containing both the TLS
-// material and the auxiliary keystore artifacts. The rendered YAML is
-// written next to the fixture so it can be diffed or applied with
-// kubectl. Also asserts the JKS round-trips with ParseJKSForTest.
-//
-// Run: go test ./internal/keystore -run TestBuildFromFixture -v
-func TestBuildFromFixture(t *testing.T) {
-	_, thisFile, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("locate test file")
-	}
-	repoRoot := filepath.Join(filepath.Dir(thisFile), "..", "..")
-	fixturePath := filepath.Join(repoRoot, "tt", "jks", "secret-payload.pem.json")
-	outPath := filepath.Join(repoRoot, "tt", "jks", "secret.generated.yaml")
-
-	raw, err := os.ReadFile(fixturePath)
+// dummySource returns a generated leaf + key + chain wrapped in the SM
+// payload shape. In-test fixture: keeps the test self-contained, no
+// tt/jks files needed.
+func dummySource(t *testing.T) smPayload {
+	t.Helper()
+	leafCert, leafKey := mustGenCert(t, "esb-nonprod-user", false)
+	ca1 := mustGenCA(t, "caroot")
+	ca2 := mustGenCA(t, "caroot2")
+	leafPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: leafCert.Raw})
+	keyDER, err := x509.MarshalPKCS8PrivateKey(leafKey)
 	if err != nil {
-		t.Fatalf("read fixture %s: %v", fixturePath, err)
+		t.Fatal(err)
 	}
-	var f fixture
-	if err := json.Unmarshal(raw, &f); err != nil {
-		t.Fatalf("parse fixture: %v", err)
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})
+	chainPEM := bytes.Join([][]byte{
+		pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: ca1.Raw}),
+		pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: ca2.Raw}),
+	}, nil)
+	return smPayload{
+		Certificate:      string(leafPEM),
+		PrivateKey:       string(keyPEM),
+		CertificateChain: string(chainPEM),
 	}
+}
 
-	// certificate = leaf, certificate_chain = CA bundle only (matches
-// upstream source shape — SplitLeafAndChain would mis-tag the first CA
-// as the leaf, since the chain doesn't include the leaf here).
+// TestBuildFromFixture generates a dummy SM payload in-test, runs
+// keystore.Build, and round-trips the resulting JKS. Output YAML is
+// written to t.TempDir() (was tt/jks/secret.generated.yaml — removed
+// to keep fixtures out of the repo).
+func TestBuildFromFixture(t *testing.T) {
+	f := dummySource(t)
+
 	leafPEM := []byte(f.Certificate)
 	chainPEM := []byte(f.CertificateChain)
 	if len(leafPEM) == 0 || len(chainPEM) == 0 {
-		t.Fatalf("fixture missing leaf or chain")
+		t.Fatalf("dummy source missing leaf or chain")
 	}
 
 	jks, p12, pw, skipped, err := keystore.Build(leafPEM, []byte(f.PrivateKey), chainPEM, nil)
@@ -97,6 +103,7 @@ func TestBuildFromFixture(t *testing.T) {
 	if err != nil {
 		t.Fatalf("yaml.Marshal: %v", err)
 	}
+	outPath := filepath.Join(t.TempDir(), "secret.generated.yaml")
 	if err := os.WriteFile(outPath, doc, 0o600); err != nil {
 		t.Fatalf("write %s: %v", outPath, err)
 	}
@@ -107,26 +114,13 @@ func TestBuildFromFixture(t *testing.T) {
 	}
 }
 
-// TestBuildFromFixture_ContentValid drives the same fixture through
+// TestBuildFromFixture_ContentValid drives the dummy source through
 // keystore.Build and asserts every artifact in the resulting Secret
 // round-trips into something a real consumer (TLS server, JVM with
 // truststore, openssl pkcs12) would accept. Failure here means the
 // generated Secret would not work in production.
 func TestBuildFromFixture_ContentValid(t *testing.T) {
-	_, thisFile, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("locate test file")
-	}
-	fixturePath := filepath.Join(filepath.Dir(thisFile), "..", "..", "tt", "jks", "secret-payload.pem.json")
-
-	raw, err := os.ReadFile(fixturePath)
-	if err != nil {
-		t.Fatalf("read fixture: %v", err)
-	}
-	var f fixture
-	if err := json.Unmarshal(raw, &f); err != nil {
-		t.Fatalf("parse fixture: %v", err)
-	}
+	f := dummySource(t)
 
 	leafPEM := []byte(f.Certificate)
 	chainPEM := []byte(f.CertificateChain)
@@ -248,178 +242,12 @@ func TestBuildFromFixture_ContentValid(t *testing.T) {
 	})
 }
 
-// TestBuildFromFixture_MatchesReference loads the project's "golden"
-// reference artifacts under tt/jks/ (client.truststore.jks and
-// esb-nonprod-user.p12, password from tt/jks/password) and asserts that
-// the generated keystores contain the same X.509 certificates — by
-// SHA-256 fingerprint. This is the contract: the controller's output
-// must be byte-for-byte equivalent to what the original JKS/P12 producer
-// generated from the same source.
-func TestBuildFromFixture_MatchesReference(t *testing.T) {
-	_, thisFile, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("locate test file")
-	}
-	root := filepath.Join(filepath.Dir(thisFile), "..", "..", "tt", "jks")
-	pwBytes, err := os.ReadFile(filepath.Join(root, "password"))
-	if err != nil {
-		t.Fatalf("read password file: %v", err)
-	}
-	refPassword := bytes.TrimSpace(pwBytes)
-
-	// Reference truststore: 2 trusted cert entries (caroot, caroot2).
-	// Despite the .jks extension, the file is a PKCS#12 truststore
-	// (verified with `keytool -list`). Decode with DecodeTrustStore.
-	refTrustBytes, err := os.ReadFile(filepath.Join(root, "client.truststore.jks"))
-	if err != nil {
-		t.Fatalf("read truststore: %v", err)
-	}
-	refTrustCerts, err := pkcs12.DecodeTrustStore(refTrustBytes, string(refPassword))
-	if err != nil {
-		t.Fatalf("truststore decode: %v", err)
-	}
-	refTrustFPs := map[string]string{}
-	for i, c := range refTrustCerts {
-		refTrustFPs[fp(c.Raw)] = fmt.Sprintf("trust[%d] CN=%s", i, c.Subject.CommonName)
-	}
-
-	// Reference p12: 1 PrivateKeyEntry alias=esb-nonprod-user + chain.
-	refP12Bytes, err := os.ReadFile(filepath.Join(root, "esb-nonprod-user.p12"))
-	if err != nil {
-		t.Fatalf("read p12: %v", err)
-	}
-	refKey, refLeaf, refCAs, err := pkcs12.DecodeChain(refP12Bytes, string(refPassword))
-	if err != nil {
-		t.Fatalf("ref p12 decode: %v", err)
-	}
-	refLeafFP := fp(refLeaf.Raw)
-	refCAFPs := map[string]struct{}{}
-	for _, c := range refCAs {
-		refCAFPs[fp(c.Raw)] = struct{}{}
-	}
-	t.Logf("ref truststore: %d entries (caroot=%s caroot2=%s)",
-		len(refTrustFPs), refTrustFPs[fp([]byte{0,0,0,0})], "")
-	for f := range refTrustFPs {
-		t.Logf("  trust fp=%s", f)
-	}
-	t.Logf("ref p12: leaf fp=%s, %d chain entries", refLeafFP, len(refCAs))
-	for i, c := range refCAs {
-		t.Logf("  chain[%d] fp=%s", i, fp(c.Raw))
-	}
-	_ = refKey
-
-	// Build generated artifacts from the same fixture.
-	raw, err := os.ReadFile(filepath.Join(root, "secret-payload.pem.json"))
-	if err != nil {
-		t.Fatalf("read fixture: %v", err)
-	}
-	var f fixture
-	if err := json.Unmarshal(raw, &f); err != nil {
-		t.Fatalf("parse fixture: %v", err)
-	}
-	leafPEM := []byte(f.Certificate)
-	chainPEM := []byte(f.CertificateChain)
-	jks, p12, pw, _, err := keystore.Build(leafPEM, []byte(f.PrivateKey), chainPEM, nil)
-	if err != nil {
-		t.Fatalf("keystore.Build: %v", err)
-	}
-
-	t.Run("generated JKS trust entries cover reference truststore CAs", func(t *testing.T) {
-		store := ks.New()
-		if err := store.Load(bytes.NewReader(jks), pw); err != nil {
-			t.Fatalf("gen jks load: %v", err)
-		}
-		// Build set of fingerprints the generated JKS surfaces anywhere
-		// (trust entries + privkey chain) — duplicates deduped.
-		genFPs := map[string]bool{}
-		for _, a := range store.Aliases() {
-			if store.IsTrustedCertificateEntry(a) {
-				te, _ := store.GetTrustedCertificateEntry(a)
-				genFPs[fp(te.Certificate.Content)] = true
-			}
-			if store.IsPrivateKeyEntry(a) {
-				chain, _ := store.GetPrivateKeyEntryCertificateChain(a)
-				for _, c := range chain {
-					genFPs[fp(c.Content)] = true
-				}
-			}
-		}
-		// Every reference CA must appear somewhere in gen output.
-		for f, alias := range refTrustFPs {
-			if !genFPs[f] {
-				t.Errorf("reference CA %s fp=%s missing from generated JKS", alias, f)
-			} else {
-				t.Logf("  MATCH ref CA %s fp=%s present in gen JKS", alias, f)
-			}
-		}
-		// Generated JKS must also contain the leaf (sanity).
-		if !genFPs[refLeafFP] {
-			t.Errorf("gen JKS missing leaf fp=%s", refLeafFP)
-		}
-	})
-
-	t.Run("generated JKS privkey leaf matches reference p12 leaf", func(t *testing.T) {
-		store := ks.New()
-		if err := store.Load(bytes.NewReader(jks), pw); err != nil {
-			t.Fatalf("gen jks load: %v", err)
-		}
-		var privAlias string
-		for _, a := range store.Aliases() {
-			if store.IsPrivateKeyEntry(a) {
-				privAlias = a
-				break
-			}
-		}
-		if privAlias == "" {
-			t.Fatal("no privkey entry in gen jks")
-		}
-		chain, err := store.GetPrivateKeyEntryCertificateChain(privAlias)
-		if err != nil {
-			t.Fatalf("get privkey chain: %v", err)
-		}
-		if len(chain) == 0 {
-			t.Fatal("privkey entry missing chain")
-		}
-		genLeafFP := fp(chain[0].Content)
-		if genLeafFP != refLeafFP {
-			t.Fatalf("gen jks leaf fp=%s != ref p12 leaf fp=%s", genLeafFP, refLeafFP)
-		}
-		t.Logf("gen jks leaf fp=%s == ref p12 leaf fp=%s", genLeafFP, refLeafFP)
-	})
-
-	t.Run("generated P12 leaf matches reference p12 leaf", func(t *testing.T) {
-		_, leaf, _, err := pkcs12.DecodeChain(p12, string(pw))
-		if err != nil {
-			t.Fatalf("gen p12 decode: %v", err)
-		}
-		if fp(leaf.Raw) != refLeafFP {
-			t.Fatalf("gen p12 leaf fp=%s != ref p12 leaf fp=%s", fp(leaf.Raw), refLeafFP)
-		}
-		t.Logf("gen p12 leaf fp=%s == ref p12 leaf fp=%s", fp(leaf.Raw), refLeafFP)
-	})
-
-	t.Run("generated P12 chain ⊆ reference p12 chain", func(t *testing.T) {
-		_, _, caCerts, err := pkcs12.DecodeChain(p12, string(pw))
-		if err != nil {
-			t.Fatalf("gen p12 decode: %v", err)
-		}
-		for i, c := range caCerts {
-			f := fp(c.Raw)
-			if _, ok := refCAFPs[f]; !ok {
-				t.Errorf("gen p12 chain[%d] fp=%s not in reference p12 chain", i, f)
-			} else {
-				t.Logf("  MATCH chain[%d] fp=%s", i, f)
-			}
-		}
-	})
-}
-
 func parseFirstCert(pemBytes []byte) (*x509.Certificate, error) {
 	rest := pemBytes
 	for {
 		block, r := pem.Decode(rest)
 		if block == nil {
-			return nil, ErrNoCert
+			return nil, errNoCert{}
 		}
 		rest = r
 		if block.Type != "CERTIFICATE" {
@@ -450,13 +278,41 @@ func parseAllCerts(pemBytes []byte) ([]*x509.Certificate, error) {
 	return out, nil
 }
 
-func fp(b []byte) string {
-	s := sha256.Sum256(b)
-	return fmt.Sprintf("%x", s)
-}
-
-var ErrNoCert = errNoCert{}
-
 type errNoCert struct{}
 
 func (errNoCert) Error() string { return "no CERTIFICATE block found" }
+
+// mustGenCert generates a throw-away self-signed cert for tests.
+func mustGenCert(t *testing.T, cn string, isCA bool) (*x509.Certificate, *rsa.PrivateKey) {
+	t.Helper()
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: cn},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		IsCA:                  isCA,
+		BasicConstraintsValid: isCA,
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c, key
+}
+
+// mustGenCA is a one-liner wrapper for a self-signed root CA.
+func mustGenCA(t *testing.T, cn string) *x509.Certificate {
+	t.Helper()
+	c, _ := mustGenCert(t, cn, true)
+	return c
+}

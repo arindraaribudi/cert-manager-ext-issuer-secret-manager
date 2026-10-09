@@ -28,6 +28,7 @@ import (
 
 	api "github.com/arindraaribudi/cert-manager-ext-issuer-secret-manager/api/v1alpha1"
 	certapi "github.com/arindraaribudi/cert-manager-ext-issuer-secret-manager/api/certificates/v1alpha1"
+	"github.com/arindraaribudi/cert-manager-ext-issuer-secret-manager/internal/aws"
 	awscertpkg "github.com/arindraaribudi/cert-manager-ext-issuer-secret-manager/internal/awscert"
 	"github.com/arindraaribudi/cert-manager-ext-issuer-secret-manager/internal/controller"
 	awscertctrl "github.com/arindraaribudi/cert-manager-ext-issuer-secret-manager/internal/controller/awscert"
@@ -36,6 +37,7 @@ import (
 	"github.com/arindraaribudi/cert-manager-ext-issuer-secret-manager/internal/tencentcert"
 
 	"github.com/aws/aws-sdk-go-v2/service/acm"
+	"github.com/aws/aws-sdk-go-v2/service/secretsmanager"
 	secretmanager "cloud.google.com/go/secretmanager/apiv1"
 	tccommon "github.com/tencentcloud/tencentcloud-sdk-go-intl-en/tencentcloud/common"
 	tcprofile "github.com/tencentcloud/tencentcloud-sdk-go-intl-en/tencentcloud/common/profile"
@@ -88,7 +90,7 @@ func BuildIssuerResolvers(ctx context.Context, kube client.Client, cmNamespace s
 	resolvers := map[string]controller.SecretResolver{}
 
 	// AWS resolvers — both Issuer + ClusterIssuer kinds share the same closure.
-	resolvers["AWSSecretManagerIssuer"] = awsResolver(ctx)
+	resolvers["AWSSecretManagerIssuer"] = awsResolver(ctx, kube, cmNamespace)
 	resolvers["AWSSecretManagerClusterIssuer"] = resolvers["AWSSecretManagerIssuer"]
 
 	// GCP
@@ -172,21 +174,101 @@ func Run(ctx context.Context, opts Options) error {
 	return mgr.Start(ctx)
 }
 
-// awsResolver returns a SecretResolver that builds a Secrets Manager client
-// lazily per region (cached). Region comes from the Issuer spec — but our
-// SecretResolver signature only sees `ref`, so we look up the Issuer each call.
-// ponytail: simple + correct; the extra Get on each reconcile is a small cost
-// vs. caching per-cert which adds complexity.
-func awsResolver(ctx context.Context) controller.SecretResolver {
-	return func(callCtx context.Context, cert *cmapi.Certificate) ([]byte, error) {
-		// AWS Secrets Manager resolver wiring is deferred (plan §10 self-review).
-		// Same richer signature as tencentResolver — region/creds live on the
-		// Issuer spec which the closure now has access to via `cert`.
-		_ = ctx
-		_ = callCtx
-		_ = cert
-		return nil, fmt.Errorf("aws: per-cert SecretResolver wiring deferred — see plan §10 self-review")
+// awsResolver returns a SecretResolver that fetches issued certs from
+// AWS Secrets Manager. Default-chain clients (IRSA / env / EC2) are cached
+// per region; static-creds clients (spec.SecretRef with AK/SK keys) are
+// rebuilt per call — the SDK constructor is microseconds and avoids a
+// composite cache key.
+func awsResolver(ctx context.Context, kube client.Client, cmNamespace string) controller.SecretResolver {
+	var mu sync.Mutex
+	cache := map[string]*secretsmanager.Client{}
+	_ = ctx
+	clientFor := func(callCtx context.Context, region, credName, credNS string) (*secretsmanager.Client, error) {
+		if credName == "" {
+			mu.Lock()
+			defer mu.Unlock()
+			if c, ok := cache[region]; ok {
+				return c, nil
+			}
+			cfg, err := awscertpkg.BuildCredentialConfig(callCtx, region)
+			if err != nil {
+				return nil, fmt.Errorf("aws: load default config for region %q: %w", region, err)
+			}
+			c := secretsmanager.NewFromConfig(cfg)
+			cache[region] = c
+			return c, nil
+		}
+		cfg, err := awscertpkg.LoadStaticCredentials(callCtx, kube, credName, credNS)
+		if err != nil {
+			return nil, fmt.Errorf("aws: load static creds from secret %s/%s: %w", credNS, credName, err)
+		}
+		// ponytail: SDK requires the region even when only Creds are overridden;
+		// LoadStaticCredentials already pins WithRegion via BuildCredentialConfig's
+		// default — but the default uses the chain's region, which may be unset
+		// when creds come from a static AK/SK pair. Re-pin to the issuer region.
+		cfg.Region = region
+		return secretsmanager.NewFromConfig(cfg), nil
 	}
+	return func(callCtx context.Context, cert *cmapi.Certificate) ([]byte, error) {
+		ref, ok := controller.SecretName(cert)
+		if !ok {
+			return nil, fmt.Errorf("aws: certificate %s/%s missing annotation %s", cert.Namespace, cert.Name, controller.AnnotationSecretName)
+		}
+		region, credName, credNS, err := awsResolveConfig(callCtx, kube, cert, cmNamespace)
+		if err != nil {
+			return nil, err
+		}
+		cli, err := clientFor(callCtx, region, credName, credNS)
+		if err != nil {
+			return nil, err
+		}
+		return aws.Wrap(cli).Fetch(callCtx, ref)
+	}
+}
+
+// awsResolveConfig looks up the Issuer/ClusterIssuer for cert, returns
+// (region, credentialSecretName, credentialSecretNamespace). Credentials
+// default to the SDK chain (IRSA / env / EC2) when spec.SecretRef is nil;
+// otherwise the named Secret must carry access-key-id + secret-access-key.
+// Empty spec.SecretRef.Namespace falls back to cert.Namespace (Issuer) or
+// cmNamespace (ClusterIssuer).
+func awsResolveConfig(ctx context.Context, kube client.Client, cert *cmapi.Certificate, cmNamespace string) (region, credName, credNS string, err error) {
+	ref := cert.Spec.IssuerRef
+	var region2 string
+	var sref *api.SecretRef
+	switch ref.Kind {
+	case "AWSSecretManagerIssuer":
+		var iss api.AWSSecretManagerIssuer
+		if err := kube.Get(ctx, types.NamespacedName{Name: ref.Name, Namespace: cert.Namespace}, &iss); err != nil {
+			return "", "", "", fmt.Errorf("aws: get AWSSecretManagerIssuer %s/%s: %w", cert.Namespace, ref.Name, err)
+		}
+		region2, sref = iss.Spec.Region, iss.Spec.SecretRef
+	case "AWSSecretManagerClusterIssuer":
+		var iss api.AWSSecretManagerClusterIssuer
+		if err := kube.Get(ctx, types.NamespacedName{Name: ref.Name}, &iss); err != nil {
+			return "", "", "", fmt.Errorf("aws: get AWSSecretManagerClusterIssuer %s: %w", ref.Name, err)
+		}
+		region2, sref = iss.Spec.Region, iss.Spec.SecretRef
+	default:
+		return "", "", "", fmt.Errorf("aws: unexpected issuer kind %q", ref.Kind)
+	}
+	if region2 == "" {
+		return "", "", "", fmt.Errorf("aws: issuer %s/%s missing spec.region", ref.Kind, ref.Name)
+	}
+	credName2, credNS2 := "", ""
+	if sref != nil {
+		credName2 = sref.Name
+		credNS2 = sref.Namespace
+		if credNS2 == "" {
+			switch ref.Kind {
+			case "AWSSecretManagerIssuer":
+				credNS2 = cert.Namespace
+			case "AWSSecretManagerClusterIssuer":
+				credNS2 = cmNamespace
+			}
+		}
+	}
+	return region2, credName2, credNS2, nil
 }
 
 func gcpResolver(ctx context.Context) controller.SecretResolver {

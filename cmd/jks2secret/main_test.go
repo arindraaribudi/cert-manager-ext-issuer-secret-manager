@@ -1,16 +1,12 @@
 package main
 
 import (
-	"bytes"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"math/big"
-	"os"
-	"path/filepath"
-	"runtime"
 	"testing"
 	"time"
 
@@ -18,27 +14,18 @@ import (
 )
 
 // TestJKS2Secret_RoundTripP12 exercises the loadSource + verifyPayload
-// pair against the keyed reference fixture (esb-nonprod-user.p12).
-// The fixture is actually PKCS#12 despite the .p12 extension, so
-// loadSource MUST auto-detect it; the SM JSON payload produced from
-// the parsed source MUST pass verifyPayload (leaf fingerprint,
-// certificate_chain set, private_key DER).
+// pair against an in-test generated keyed PKCS#12. The dummy source
+// has a leaf with CN=esb-nonprod-user plus a 2-cert chain, so
+// loadSource MUST auto-detect the PKCS#12 magic and verifyPayload MUST
+// accept the SM JSON payload (leaf fingerprint, certificate_chain set,
+// private_key DER).
 func TestJKS2Secret_RoundTripP12(t *testing.T) {
-	_, thisFile, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("locate test file")
-	}
-	root := filepath.Join(filepath.Dir(thisFile), "..", "..", "tt", "jks")
-	pwBytes, err := os.ReadFile(filepath.Join(root, "password"))
-	if err != nil {
-		t.Fatalf("read password: %v", err)
-	}
-	password := bytes.TrimRight(pwBytes, "\r\n")
+	leafCert, leafKey := mustSelfSigned(t, "esb-nonprod-user")
+	ca1 := mustSelfSignedCA(t, "caroot")
+	ca2 := mustSelfSignedCA(t, "caroot2")
+	password := []byte("dummy-pw")
 
-	srcBytes, err := os.ReadFile(filepath.Join(root, "esb-nonprod-user.p12"))
-	if err != nil {
-		t.Fatalf("read source: %v", err)
-	}
+	srcBytes := mustEncodeKeyedP12(t, leafCert, leafKey, []*x509.Certificate{ca1, ca2}, string(password))
 
 	sk, err := loadSource(srcBytes, password)
 	if err != nil {
@@ -64,23 +51,16 @@ func TestJKS2Secret_RoundTripP12(t *testing.T) {
 	t.Logf("round-trip OK: leaf + %d chain + key (%d bytes PKCS#8)", len(sk.chain), len(sk.keyDER))
 }
 
-// TestJKS2Secret_LoadSource_KeylessTruststore checks the auto-detect
-// falls back to PKCS#12 (keystore-go rejects keyless PKCS#12 with
-// "got invalid magic") and rejects the keyless case via Main, while
-// loadSource itself returns a populated leaf + chain.
+// TestJKS2Secret_LoadSource_KeylessTruststore checks loadSource
+// auto-detects a keyless PKCS#12 truststore, promotes the first cert to
+// leaf, and sets the keyless flag.
 func TestJKS2Secret_LoadSource_KeylessTruststore(t *testing.T) {
-	_, thisFile, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("locate test file")
-	}
-	root := filepath.Join(filepath.Dir(thisFile), "..", "..", "tt", "jks")
-	pwBytes, _ := os.ReadFile(filepath.Join(root, "password"))
-	password := bytes.TrimRight(pwBytes, "\r\n")
+	ca1 := mustSelfSignedCA(t, "trust-root-1")
+	ca2 := mustSelfSignedCA(t, "trust-root-2")
+	ca3 := mustSelfSignedCA(t, "trust-root-3")
+	password := []byte("dummy-pw")
 
-	srcBytes, err := os.ReadFile(filepath.Join(root, "client.truststore.jks"))
-	if err != nil {
-		t.Fatalf("read truststore: %v", err)
-	}
+	srcBytes := mustEncodeTrustStoreP12(t, []*x509.Certificate{ca1, ca2, ca3}, string(password))
 	sk, err := loadSource(srcBytes, password)
 	if err != nil {
 		t.Fatalf("loadSource: %v", err)

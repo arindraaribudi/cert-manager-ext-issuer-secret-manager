@@ -24,6 +24,13 @@ func New(ctx context.Context, region string) (*Client, error) {
 	return &Client{api: secretsmanager.NewFromConfig(cfg)}, nil
 }
 
+// Wrap adapts a prebuilt Secrets Manager client. Use when the caller
+// already has the aws.Config composed (static creds from spec.SecretRef,
+// custom endpoint, etc.) and only needs the Fetch shape.
+func Wrap(api *secretsmanager.Client) *Client {
+	return &Client{api: api}
+}
+
 // Fetch returns the SecretString payload as raw bytes.
 func (c *Client) Fetch(ctx context.Context, name string) ([]byte, error) {
 	out, err := c.api.GetSecretValue(ctx, &secretsmanager.GetSecretValueInput{SecretId: &name})

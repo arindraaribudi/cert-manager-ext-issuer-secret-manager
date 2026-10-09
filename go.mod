@@ -1,6 +1,6 @@
 module github.com/arindraaribudi/cert-manager-ext-issuer-secret-manager
 
-go 1.27
+go 1.27.2
 
 require (
 	cloud.google.com/go/secretmanager v1.21.0
