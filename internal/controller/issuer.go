@@ -163,7 +163,7 @@ func (r *IssuerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 			"cert", req.String()), nil
 	}
 
-	jks, p12, pw, skipped, err := BuildKeystore(parsed.Certificate, parsed.PrivateKey, chainForSecret,
+	jks, p12, pw, truststore, skipped, err := BuildKeystore(parsed.Certificate, parsed.PrivateKey, chainForSecret,
 		keystoreExisting, secretTemplate.Annotations[AnnotationSourceHash])
 	if err != nil {
 		// ponytail: keystore build failure is soft drift — TLS Secret still
@@ -171,9 +171,17 @@ func (r *IssuerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		// reconciles and deleting it would break consumers. Next reconcile
 		// retries the keystore step.
 		_ = MarkCertDrift(ctx, r.Client, &cert, "KeystoreBuildFailed", err.Error())
-	} else if skipped {
-		_ = MarkCertDrift(ctx, r.Client, &cert, "KeystoreSkipped", "source payload lacks a private key; JKS/PKCS12 not generated")
+	} else if skipped && len(truststore) == 0 {
+		_ = MarkCertDrift(ctx, r.Client, &cert, "KeystoreSkipped", "source payload lacks a private key and chain; no keystore output")
 	} else {
+		if skipped {
+			// Chain-only payload: truststore.jks + ca.crt (already set above)
+			// are the only keystore artifacts. Informational drift only.
+			_ = MarkCertDrift(ctx, r.Client, &cert, "TruststoreOnly", "source payload lacks a private key; producing truststore.jks + ca.crt")
+		}
+		if len(truststore) > 0 {
+			secretTemplate.Data["truststore.jks"] = truststore
+		}
 		secretTemplate.Data["keystore.jks"] = jks
 		secretTemplate.Data["keystore.p12"] = p12
 		secretTemplate.Data["keystore.password"] = pw

@@ -74,13 +74,14 @@ func TestBuildKeystore_ReusesOnUnchangedSource(t *testing.T) {
 		"keystore.jks":      []byte("JKS"),
 		"keystore.p12":      []byte("P12"),
 		"keystore.password": []byte("PW"),
+		"truststore.jks":    []byte("TS"),
 	}, "src1")
 
-	jks, p12, pw, skipped, err := BuildKeystore([]byte("cert"), []byte("key"), nil, existing, "src1")
+	jks, p12, pw, ts, skipped, err := BuildKeystore([]byte("cert"), []byte("key"), nil, existing, "src1")
 	if err != nil || skipped {
 		t.Fatalf("err=%v skipped=%v", err, skipped)
 	}
-	if string(jks) != "JKS" || string(p12) != "P12" || string(pw) != "PW" {
+	if string(jks) != "JKS" || string(p12) != "P12" || string(pw) != "PW" || string(ts) != "TS" {
 		t.Fatal("want verbatim reuse of existing keystore bytes")
 	}
 }

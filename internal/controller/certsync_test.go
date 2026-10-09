@@ -19,6 +19,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	api "github.com/arindraaribudi/cert-manager-ext-issuer-secret-manager/api/v1alpha1"
+	"github.com/arindraaribudi/cert-manager-ext-issuer-secret-manager/internal/keystore"
 )
 
 // testLeafPEM is a real (but throwaway) self-signed cert — VerifySecretData
@@ -270,5 +271,57 @@ func TestCertSyncer_Reconcile_KeystoreSkipped_NoPrivateKey(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("want ExternalIssuerSynced/Synced condition (keystore-skip is transient), got %+v", got.Status.Conditions)
+	}
+}
+
+// TestCertSyncer_Reconcile_ChainOnly_TruststoreAndCaCrt covers the case
+// where the cloud provider returns only a chain (no separate leaf, no key):
+// the driver must produce truststore.jks + ca.crt and skip the keyed
+// keystore. Mirrors the chain-only contract on the SM IssuerReconciler
+// path so both drivers share the same TruststoreOnly surface.
+func TestCertSyncer_Reconcile_ChainOnly_TruststoreAndCaCrt(t *testing.T) {
+	s := newTestScheme(t)
+	cert := newTestCert("c-chainonly", "default", "gate-key", "ref-1")
+	kube := fake.NewClientBuilder().WithScheme(s).WithObjects(cert).WithStatusSubresource(&cmapi.Certificate{}).Build()
+	src := &stubSource{
+		annotationKey: "gate-key",
+		fetchResult: &FetchResult{
+			// LeafPEM nil (upstream returned only a chain); ChainPEM non-nil.
+			// KeyPEM nil — same as KeystoreSkipped_NoPrivateKey.
+			ChainPEM:        []byte(testLeafPEM),
+			NamespaceFilter: api.NamespaceFilter{},
+			ResyncInterval:  5 * time.Minute,
+		},
+	}
+	r := &CertSyncer{Client: kube, Scheme: s, Source: src}
+
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "c-chainonly", Namespace: "default"}}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var sec corev1.Secret
+	if err := kube.Get(context.Background(), types.NamespacedName{Name: "c-chainonly-tls", Namespace: "default"}, &sec); err != nil {
+		t.Fatalf("expected Secret to be written: %v", err)
+	}
+	// tls.crt = chain (LeafPEM nil → certsync.go line 112 yields tlsCrt=ChainPEM).
+	if string(sec.Data[corev1.TLSCertKey]) != string([]byte(testLeafPEM)) {
+		t.Errorf("tls.crt = %q, want chain", sec.Data[corev1.TLSCertKey])
+	}
+	// ca.crt = chain.
+	if string(sec.Data[corev1.ServiceAccountRootCAKey]) != string([]byte(testLeafPEM)) {
+		t.Errorf("ca.crt = %q, want chain", sec.Data[corev1.ServiceAccountRootCAKey])
+	}
+	// truststore.jks present and loadable with empty password.
+	if len(sec.Data["truststore.jks"]) == 0 {
+		t.Fatal("truststore.jks missing in chain-only certsync mode")
+	}
+	if err := keystore.ParseJKSForTest(sec.Data["truststore.jks"], nil); err != nil {
+		t.Fatalf("truststore.jks load with empty password: %v", err)
+	}
+	// No keyed keystore artifacts.
+	for _, k := range []string{"keystore.jks", "keystore.p12", "keystore.password"} {
+		if len(sec.Data[k]) != 0 {
+			t.Errorf("%s unexpectedly non-empty in chain-only mode: %d bytes", k, len(sec.Data[k]))
+		}
 	}
 }

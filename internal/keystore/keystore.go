@@ -156,6 +156,43 @@ func buildPKCS12(certPEM, keyPEM, chainPEM, password []byte) ([]byte, error) {
 	return pkcs12.LegacyRC2.WithRand(rand.Reader).Encode(priv, leaf, caPtrs, string(password))
 }
 
+// BuildTruststore creates a JKS containing only TrustedCertificateEntry
+// values (one per cert in chainPEM). No PrivateKeyEntry — the truststore
+// is read-only by design, suitable for Java clients that need to validate
+// signatures against the issuer's CA bundle. Stored with an empty-string
+// password: keystore-go requires *some* password for the integrity check,
+// but Java's KeyStore.load(stream, "") accepts the resulting file as a
+// truststore (read-only).
+//
+// ponytail: empty password is a deliberate contract — embedding the
+// keystore.jks password here would leak it into every Secret that uses
+// chain-only sources. Consumers that need a password (legacy Java 6 /
+// Tomcat 6) can wrap the resulting JKS themselves.
+func BuildTruststore(chainPEM []byte) ([]byte, error) {
+	chainCerts, err := parseChainDER(chainPEM)
+	if err != nil {
+		return nil, err
+	}
+	if len(chainCerts) == 0 {
+		return nil, nil
+	}
+	store := ks.New()
+	now := time.Now().UTC()
+	for i, c := range chainCerts {
+		if err := store.SetTrustedCertificateEntry(
+			fmt.Sprintf("chain-%d", i),
+			ks.TrustedCertificateEntry{CreationTime: now, Certificate: ks.Certificate{Type: "X.509", Content: c.Raw}},
+		); err != nil {
+			return nil, fmt.Errorf("keystore: set trust entry %d: %w", i, err)
+		}
+	}
+	var buf bytes.Buffer
+	if err := store.Store(&buf, nil); err != nil {
+		return nil, fmt.Errorf("keystore: store truststore: %w", err)
+	}
+	return buf.Bytes(), nil
+}
+
 // aliasFor returns the keystore alias for the leaf certificate.
 // Order: Subject.CN → first DNS name → literal "leaf".
 func aliasFor(leaf *x509.Certificate) string {

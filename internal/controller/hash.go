@@ -68,12 +68,29 @@ func HashSecretData(data map[string][]byte) string {
 // reconcile — which would make the secret-hash comparison never match and
 // re-write the Secret forever. Reusing on an unchanged source is both the
 // cheaper and the correct path.
-func BuildKeystore(certPEM, keyPEM, chainPEM []byte, existing *corev1.Secret, srcHash string) (jks, p12, password []byte, skipped bool, err error) {
+//
+// Returns truststore whenever chainPEM is non-empty — a pure-truststore
+// JKS (no PrivateKeyEntry) suitable for Java clients that need to trust
+// the CA bundle without holding the leaf key. Callers should set
+// Secret.Data["truststore.jks"] when this is non-nil.
+func BuildKeystore(certPEM, keyPEM, chainPEM []byte, existing *corev1.Secret, srcHash string) (jks, p12, password, truststore []byte, skipped bool, err error) {
 	if existing != nil && srcHash != "" && existing.Annotations[AnnotationSourceHash] == srcHash {
-		j, p, pw := existing.Data["keystore.jks"], existing.Data["keystore.p12"], existing.Data["keystore.password"]
-		if len(j) > 0 && len(p) > 0 && len(pw) > 0 {
-			return j, p, pw, false, nil
+		j, p, pw, ts := existing.Data["keystore.jks"], existing.Data["keystore.p12"], existing.Data["keystore.password"], existing.Data["truststore.jks"]
+		// reuse requires all four artifacts on the existing Secret — partial
+		// data means an older reconcile left the truststore unset and we
+		// should regenerate it now.
+		hasAll := len(j) > 0 && len(p) > 0 && len(pw) > 0
+		hasAll = hasAll && (len(chainPEM) == 0 || len(ts) > 0)
+		if hasAll {
+			return j, p, pw, ts, false, nil
 		}
 	}
-	return keystore.Build(certPEM, keyPEM, chainPEM, existing)
+	jks, p12, password, skipped, err = keystore.Build(certPEM, keyPEM, chainPEM, existing)
+	if err != nil {
+		return
+	}
+	if len(chainPEM) > 0 {
+		truststore, err = keystore.BuildTruststore(chainPEM)
+	}
+	return
 }

@@ -24,7 +24,7 @@ func TestBuildKeystore_IncludesCompletedRootChain(t *testing.T) {
 	tlsCrt = completeChain(tlsCrt, [][]byte{rootPEM}) // simulate a matching known root
 
 	keystoreLeaf, keystoreChain := keystore.SplitLeafAndChain(tlsCrt)
-	jks, _, pw, skipped, err := BuildKeystore(keystoreLeaf, keyPEM, keystoreChain, nil, "srchash")
+	jks, _, pw, _, skipped, err := BuildKeystore(keystoreLeaf, keyPEM, keystoreChain, nil, "srchash")
 	if err != nil {
 		t.Fatalf("BuildKeystore: %v", err)
 	}
